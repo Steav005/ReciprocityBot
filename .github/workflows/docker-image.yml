@@ -1,0 +1,27 @@
+name: Build and release Docker images
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Publish to Dockerhub
+        uses: sergeysova/docker-publish-action@master
+        with:
+          image: autumnal/reciprocity_bot
+          username: autumnal
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          tag_semver: fail
+          semver_higher: true
+      - name: Sync Readme
+        uses: ms-jpq/sync-dockerhub-readme@v1
+        with:
+          username: autumnal
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: autumnal/reciprocity_bot
+          readme: "./README.md"
