@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 arrayvec = "0.5.2"
+log = "0.4.11"
 futures = "0.3.8"
 tokio = { version = "0.3.3", features = ["full"] }
 
