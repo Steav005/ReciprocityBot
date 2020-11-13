@@ -9,7 +9,7 @@ use serenity::model::id::{ChannelId, GuildId};
 use serenity::static_assertions::_core::pin::Pin;
 use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::mpsc::error::{SendError, TrySendError};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender};
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
@@ -139,12 +139,42 @@ impl TaskScheduler {
         )
     }
 
-    pub fn try_send_task(&self, task: TaskHandler) -> Result<(), TrySendError<TaskHandler>> {
-        self.task_sender.try_send(task)
+    /// Changes the channel_id in case the Bot Channel Changed
+    pub fn change_channel_id(&self, channel_id: ChannelId) {
+        if self.channel_id_sender.t.send(channel_id).is_err() {
+            let msg = format!(
+                "Channel Change Receiver dropped. Guild: {:?}",
+                self.guild_id.t
+            );
+            error!("{}", &msg);
+            panic!(msg)
+        }
     }
 
-    pub async fn send_task(&self, task: TaskHandler) -> Result<(), SendError<TaskHandler>> {
-        self.task_sender.send(task).await
+    ///Does not Block if the Buffer is full
+    pub fn try_send_task(&self, task: TaskHandler) {
+        if let Err(err) = self.task_sender.try_send(task) {
+            match err {
+                TrySendError::Full(task) => {
+                    warn!("Buffer Full. Guild: {:?}", self.guild_id.t);
+                    task.drop();
+                }
+                TrySendError::Closed(_) => {
+                    let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
+                    error!("{}", &msg);
+                    panic!(msg)
+                }
+            }
+        }
+    }
+
+    ///Blocks if the Buffer is full
+    pub async fn send_task(&self, task: TaskHandler) {
+        if self.task_sender.send(task).await.is_err() {
+            let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
+            error!("{}", &msg);
+            panic!(msg)
+        };
     }
 }
 
