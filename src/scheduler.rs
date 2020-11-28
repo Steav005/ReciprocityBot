@@ -18,7 +18,7 @@ use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender}
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
-const QUEUE_LIMIT: usize = 10000;
+const QUEUE_LIMIT: usize = 1000;
 
 pub struct Final<T> {
     t: T,
@@ -42,6 +42,7 @@ impl<T> Deref for Final<T> {
 #[derive(Debug)]
 pub enum TaskError {
     FailedExecution(SerenityError),
+    BotDoesNotExist(),
     Dropped(),
 }
 
@@ -50,7 +51,6 @@ pub enum Task {
     DeleteMessageReaction(ChannelId, MessageId, UserId, ReactionType),
     DeleteMessage(ChannelId, MessageId),
     AddMessageReaction(ChannelId, MessageId, ReactionType),
-    //TODO Add more Tasks
 }
 
 ///All the Routes which will be used by any Task
@@ -117,6 +117,12 @@ impl TaskHandler {
         }
     }
 
+    pub fn drop_no_bot(self) {
+        if let Err(err) = self.sender.send(Err(TaskError::BotDoesNotExist())) {
+            debug!("Task Error was dropped: {:?}", err.unwrap_err())
+        }
+    }
+
     ///Returns the Route, the underlying Task requires
     pub fn get_route_id(&self) -> usize {
         let route = match self.task.t {
@@ -144,7 +150,7 @@ impl TaskScheduler {
         guild_id: GuildId,
         channel_id: ChannelId,
         worker: Vec<&'a Http>,
-    ) -> (TaskScheduler, Pin<Box<dyn Future<Output = ()> + 'a>>) {
+    ) -> (Self, Pin<Box<dyn Future<Output = ()> + 'a>>) {
         let (task_sender, task_receiver) = mpsc::channel(QUEUE_LIMIT);
         let (channel_id_sender, channel_id_receiver) = watch::channel(channel_id);
 
@@ -224,6 +230,7 @@ async fn split_receive(
             Some(task) => task,
         };
         let route_id = task.get_route_id();
+
         if let Err(err) = sender[route_id].try_send(task) {
             match err {
                 TrySendError::Full(task) => {
@@ -253,23 +260,23 @@ async fn run_async(
     task_receiver: MpscReceiver<TaskHandler>,
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
-    let mut senders = ArrayVec::new();
-    let mut receivers: ArrayVec<[MpscReceiver<TaskHandler>; ROUTES.len()]> = ArrayVec::new();
+    let mut route_senders = ArrayVec::new();
+    let mut route_receivers: ArrayVec<[MpscReceiver<TaskHandler>; ROUTES.len()]> = ArrayVec::new();
 
     for _ in 0..ROUTES.len() {
         let (s, r) = mpsc::channel(QUEUE_LIMIT);
-        senders.push(s);
-        receivers.push(r);
+        route_senders.push(s);
+        route_receivers.push(r);
     }
 
     //This one is for taking any received tasks and pushing it to the appropriate receiver
-    let sender = senders.into_inner().unwrap();
-    pool.push(Box::pin(split_receive(task_receiver, sender, guild_id)));
+    let route_senders = route_senders.into_inner().unwrap();
+    pool.push(Box::pin(split_receive(task_receiver, route_senders, guild_id)));
 
     //Here we start the receivers. They will schedule any received task to a free Http object
     for route in ROUTES.iter() {
         pool.push(Box::pin(task_type_scheduler(
-            receivers.pop_at(0).expect("Not enough Receivers"),
+            route_receivers.pop_at(0).expect("Not enough Receivers"),
             *route,
             guild_id,
             channel_id_receiver.clone(),
@@ -285,18 +292,18 @@ async fn run_async(
 
 //Hosts all Https for this Task
 async fn task_type_scheduler(
-    receiver: MpscReceiver<TaskHandler>,
+    shared_receiver: MpscReceiver<TaskHandler>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
     channel_id: WatchReceiver<ChannelId>,
     worker: Vec<&Http>,
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
-    let receiver = Arc::new(RwLock::new(receiver));
+    let shared_receiver = Arc::new(RwLock::new(shared_receiver));
 
     for w in worker.iter() {
         pool.push(Box::pin(task_http_loop(
-            receiver.clone(),
+            shared_receiver.clone(),
             route,
             guild_id,
             channel_id.clone(),
@@ -310,14 +317,14 @@ async fn task_type_scheduler(
 
 //Makes sure Http is ready for Task, then tries to get one, for executing it
 async fn task_http_loop(
-    receiver: Arc<RwLock<MpscReceiver<TaskHandler>>>,
+    shared_receiver: Arc<RwLock<MpscReceiver<TaskHandler>>>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
     channel_id: WatchReceiver<ChannelId>,
     worker: &Http,
 ) {
     loop {
-        let rate = {
+        let ready = {
             let routes_map = worker.ratelimiter.routes();
             let routes_map = routes_map.read().await;
             let channel_id = *channel_id.borrow();
@@ -351,10 +358,9 @@ async fn task_http_loop(
             }
         };
 
-        match rate {
+        match ready {
             Ok(_) => {
-                let task = receiver.write().await.recv().await;
-                task.expect("Task splitter was dropped").run(worker).await;
+                shared_receiver.write().await.recv().await.expect("Task splitter was dropped").run(worker).await;
             }
             Err(duration) => {
                 tokio::time::sleep(duration).await;

@@ -4,6 +4,7 @@ use serenity::model::id::{ChannelId, GuildId};
 use serenity::Client;
 
 mod scheduler;
+mod guild_handler;
 
 #[tokio::main]
 async fn main() {
