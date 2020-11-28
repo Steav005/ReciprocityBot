@@ -1,11 +1,14 @@
 #![allow(dead_code)]
 
+use crate::scheduler::TaskError::FailedExecution;
 use arrayvec::ArrayVec;
 use futures::prelude::*;
 use log::{debug, error, warn};
 use serenity::http::routing::Route;
 use serenity::http::Http;
-use serenity::model::id::{ChannelId, GuildId};
+use serenity::model::channel::ReactionType;
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
+use serenity::prelude::SerenityError;
 use serenity::static_assertions::_core::pin::Pin;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -35,21 +38,25 @@ impl<T> Deref for Final<T> {
     }
 }
 
+///Any Error that can be returned by any "enqueued" Task
 #[derive(Debug)]
 pub enum TaskError {
-    FailedExecution(),
+    FailedExecution(SerenityError),
     Dropped(),
 }
 
+///The Tasks, that can be enqueued
 pub enum Task {
-    DeleteMessageReaction(u64), //Route 0,
-    DeleteMessage(u64),         //Route 1,
-                                //TODO Add more Tasks
+    DeleteMessageReaction(ChannelId, MessageId, UserId, ReactionType),
+    DeleteMessage(ChannelId, MessageId),
+    AddMessageReaction(ChannelId, MessageId, ReactionType),
+    //TODO Add more Tasks
 }
 
-pub const ROUTES_NUM: usize = 2;
-pub static ROUTES: [fn(ChannelId, GuildId) -> Route; ROUTES_NUM] =
-    [channel_id_message, channel_id_message_id_reaction];
+///All the Routes which will be used by any Task
+pub const ROUTES_NUM: usize = 3;
+pub const  ROUTES: [fn(ChannelId, GuildId) -> Route; ROUTES_NUM] =
+    [channel_id_message_id_reaction, channel_id_message, channel_id_message_id_reaction_self];
 
 const fn channel_id_message_id_reaction(channel: ChannelId, _: GuildId) -> Route {
     Route::ChannelsIdMessagesIdReactions(channel.0)
@@ -59,6 +66,11 @@ const fn channel_id_message(channel: ChannelId, _: GuildId) -> Route {
     Route::ChannelsIdMessages(channel.0)
 }
 
+const fn channel_id_message_id_reaction_self(channel: ChannelId, _: GuildId) -> Route{
+    Route::ChannelsIdMessagesIdReactionsUserIdType(channel.0)
+}
+
+///Task Handler, which will handle the execution, errors and general Task information
 pub struct TaskHandler {
     pub receiver: Final<OneShotReceiver<Result<(), TaskError>>>,
     sender: OneShotSender<Result<(), TaskError>>,
@@ -66,6 +78,7 @@ pub struct TaskHandler {
 }
 
 impl TaskHandler {
+    ///Builds a TaskHandler from a Task
     pub fn new(task: Task) -> TaskHandler {
         let (sender, receiver) = oneshot::channel();
 
@@ -76,16 +89,21 @@ impl TaskHandler {
         }
     }
 
-    pub async fn run(self, _client: &Http) {
+    ///Tries to complete the Task with the help of an Http Instance
+    pub async fn run(self, client: &Http) {
         let result: Result<(), TaskError> = match self.task.deref() {
-            Task::DeleteMessageReaction(_) => {
-                //TODO implement
-                Ok(())
-            }
-            Task::DeleteMessage(_) => {
-                //TODO implement
-                Ok(())
-            }
+            Task::DeleteMessageReaction(channel, message, user, reaction) => client
+                .delete_reaction(channel.0, message.0, Some(user.0), reaction)
+                .await
+                .map_err(FailedExecution),
+            Task::DeleteMessage(channel, message) => client
+                .delete_message(channel.0, message.0)
+                .await
+                .map_err(FailedExecution),
+            Task::AddMessageReaction(channel, message, reaction) => client
+                .create_reaction(channel.0, message.0, reaction)
+                .await
+                .map_err(FailedExecution),
         };
 
         if let Err(err) = self.sender.send(result) {
@@ -93,20 +111,28 @@ impl TaskHandler {
         }
     }
 
+    ///Drops the Task/TaskHandler
     pub fn drop(self) {
         if let Err(err) = self.sender.send(Err(TaskError::Dropped())) {
             debug!("Task Error was dropped: {:?}", err.unwrap_err())
         }
     }
 
+    ///Returns the Route, the underlying Task requires
     pub fn get_route_id(&self) -> usize {
-        match self.task.t {
-            Task::DeleteMessageReaction(_) => 0,
-            Task::DeleteMessage(_) => 1,
-        }
+        let route = match self.task.t {
+            Task::DeleteMessageReaction(_, _, _, _) =>
+            channel_id_message_id_reaction
+            ,
+            Task::DeleteMessage(_, _) => channel_id_message,
+            Task::AddMessageReaction(_, _, _) => channel_id_message_id_reaction_self,
+        } as usize;
+
+        ROUTES.iter().position(|f| *f as usize == route).expect("Route not Found")
     }
 }
 
+///Schedules Tasks within a Guild
 pub struct TaskScheduler {
     pub task_sender: Final<MpscSender<TaskHandler>>,
     pub guild_id: Final<GuildId>,
@@ -114,6 +140,7 @@ pub struct TaskScheduler {
 }
 
 impl TaskScheduler {
+    ///Builds a new Scheduler for a Guild based on the used Https
     pub fn new<'a>(
         guild_id: GuildId,
         channel_id: ChannelId,
@@ -129,7 +156,9 @@ impl TaskScheduler {
         };
 
         (
+            // The Scheduler used for enqueuing new Tasks
             scheduler,
+            // Future which will run the Scheduler
             Box::pin(run_async(
                 worker,
                 guild_id,
@@ -152,12 +181,13 @@ impl TaskScheduler {
     }
 
     ///Does not Block if the Buffer is full
-    pub fn try_send_task(&self, task: TaskHandler) {
+    pub fn try_send_task(&self, task: TaskHandler) -> Result<(), ()> {
         if let Err(err) = self.task_sender.try_send(task) {
             match err {
                 TrySendError::Full(task) => {
                     warn!("Buffer Full. Guild: {:?}", self.guild_id.t);
                     task.drop();
+                    return Err(());
                 }
                 TrySendError::Closed(_) => {
                     let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
@@ -166,6 +196,7 @@ impl TaskScheduler {
                 }
             }
         }
+        Ok(())
     }
 
     ///Blocks if the Buffer is full
@@ -178,7 +209,7 @@ impl TaskScheduler {
     }
 }
 
-//Receive Task and send it to the proper scheduler
+/// Receive Task and send it to the proper scheduler
 async fn split_receive(
     mut receiver: MpscReceiver<TaskHandler>,
     sender: [MpscSender<TaskHandler>; ROUTES_NUM],
