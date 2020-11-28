@@ -1,8 +1,7 @@
-use crate::scheduler::{TaskScheduler, Task, TaskHandler};
+use crate::scheduler::{TaskScheduler};
 use serenity::http::CacheHttp;
-use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
+use serenity::model::id::{ChannelId, GuildId};
 use serenity::Client;
-use serenity::model::channel::ReactionType;
 
 mod scheduler;
 

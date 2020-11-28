@@ -54,8 +54,7 @@ pub enum Task {
 }
 
 ///All the Routes which will be used by any Task
-pub const ROUTES_NUM: usize = 3;
-pub const  ROUTES: [fn(ChannelId, GuildId) -> Route; ROUTES_NUM] =
+pub const  ROUTES: [fn(ChannelId, GuildId) -> Route; 3] =
     [channel_id_message_id_reaction, channel_id_message, channel_id_message_id_reaction_self];
 
 const fn channel_id_message_id_reaction(channel: ChannelId, _: GuildId) -> Route {
@@ -212,7 +211,7 @@ impl TaskScheduler {
 /// Receive Task and send it to the proper scheduler
 async fn split_receive(
     mut receiver: MpscReceiver<TaskHandler>,
-    sender: [MpscSender<TaskHandler>; ROUTES_NUM],
+    sender: [MpscSender<TaskHandler>; ROUTES.len()],
     guild_id: GuildId,
 ) {
     loop {
@@ -255,7 +254,7 @@ async fn run_async(
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
     let mut senders = ArrayVec::new();
-    let mut receivers: ArrayVec<[MpscReceiver<TaskHandler>; ROUTES_NUM]> = ArrayVec::new();
+    let mut receivers: ArrayVec<[MpscReceiver<TaskHandler>; ROUTES.len()]> = ArrayVec::new();
 
     for _ in 0..ROUTES.len() {
         let (s, r) = mpsc::channel(QUEUE_LIMIT);
