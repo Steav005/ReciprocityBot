@@ -1,10 +1,12 @@
-use crate::scheduler::{TaskScheduler};
+use crate::scheduler::TaskScheduler;
 use serenity::http::CacheHttp;
 use serenity::model::id::{ChannelId, GuildId};
 use serenity::Client;
 
-mod scheduler;
+mod event_handler;
 mod guild_handler;
+mod scheduler;
+mod structs;
 
 #[tokio::main]
 async fn main() {

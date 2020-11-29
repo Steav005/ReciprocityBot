@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
-use serenity::model::id::{ChannelId, GuildId};
 use crate::scheduler::TaskScheduler;
-use serenity::http::Http;
-use std::pin::Pin;
 use futures::prelude::*;
+use serenity::http::Http;
+use serenity::model::id::{ChannelId, GuildId};
+use std::pin::Pin;
 
-pub struct ReciprocityGuild<'a>{
+pub struct ReciprocityGuild<'a> {
     guild: GuildId,
     channel: ChannelId,
     scheduler: TaskScheduler,
@@ -16,13 +16,15 @@ pub struct ReciprocityGuild<'a>{
     // Something for VoiceHandling
 }
 
-
-impl<'a> ReciprocityGuild<'a>{
-    pub fn new(guild: GuildId, channel: ChannelId, bots: Vec<&'a Http>,
-    ) -> (Self, Pin<Box<dyn Future<Output = ()> + 'a>>){
+impl<'a> ReciprocityGuild<'a> {
+    pub fn new(
+        guild: GuildId,
+        channel: ChannelId,
+        bots: Vec<&'a Http>,
+    ) -> (Self, Pin<Box<dyn Future<Output = ()> + 'a>>) {
         let (scheduler, _runner) = TaskScheduler::new(guild, channel, bots.clone());
 
-        let _guild = ReciprocityGuild{
+        let _guild = ReciprocityGuild {
             guild,
             channel,
             scheduler,

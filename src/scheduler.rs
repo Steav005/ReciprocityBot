@@ -2,6 +2,7 @@
 
 use crate::scheduler::TaskError::FailedExecution;
 use arrayvec::ArrayVec;
+use async_std::sync::Arc;
 use futures::prelude::*;
 use log::{debug, error, warn};
 use serenity::http::routing::Route;
@@ -9,9 +10,8 @@ use serenity::http::Http;
 use serenity::model::channel::ReactionType;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::SerenityError;
-use serenity::static_assertions::_core::pin::Pin;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::pin::Pin;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender};
@@ -54,8 +54,11 @@ pub enum Task {
 }
 
 ///All the Routes which will be used by any Task
-pub const  ROUTES: [fn(ChannelId, GuildId) -> Route; 3] =
-    [channel_id_message_id_reaction, channel_id_message, channel_id_message_id_reaction_self];
+pub const ROUTES: [fn(ChannelId, GuildId) -> Route; 3] = [
+    channel_id_message_id_reaction,
+    channel_id_message,
+    channel_id_message_id_reaction_self,
+];
 
 const fn channel_id_message_id_reaction(channel: ChannelId, _: GuildId) -> Route {
     Route::ChannelsIdMessagesIdReactions(channel.0)
@@ -65,7 +68,7 @@ const fn channel_id_message(channel: ChannelId, _: GuildId) -> Route {
     Route::ChannelsIdMessages(channel.0)
 }
 
-const fn channel_id_message_id_reaction_self(channel: ChannelId, _: GuildId) -> Route{
+const fn channel_id_message_id_reaction_self(channel: ChannelId, _: GuildId) -> Route {
     Route::ChannelsIdMessagesIdReactionsUserIdType(channel.0)
 }
 
@@ -126,14 +129,15 @@ impl TaskHandler {
     ///Returns the Route, the underlying Task requires
     pub fn get_route_id(&self) -> usize {
         let route = match self.task.t {
-            Task::DeleteMessageReaction(_, _, _, _) =>
-            channel_id_message_id_reaction
-            ,
+            Task::DeleteMessageReaction(_, _, _, _) => channel_id_message_id_reaction,
             Task::DeleteMessage(_, _) => channel_id_message,
             Task::AddMessageReaction(_, _, _) => channel_id_message_id_reaction_self,
         } as usize;
 
-        ROUTES.iter().position(|f| *f as usize == route).expect("Route not Found")
+        ROUTES
+            .iter()
+            .position(|f| *f as usize == route)
+            .expect("Route not Found")
     }
 }
 
@@ -271,7 +275,11 @@ async fn run_async(
 
     //This one is for taking any received tasks and pushing it to the appropriate receiver
     let route_senders = route_senders.into_inner().unwrap();
-    pool.push(Box::pin(split_receive(task_receiver, route_senders, guild_id)));
+    pool.push(Box::pin(split_receive(
+        task_receiver,
+        route_senders,
+        guild_id,
+    )));
 
     //Here we start the receivers. They will schedule any received task to a free Http object
     for route in ROUTES.iter() {
@@ -360,7 +368,14 @@ async fn task_http_loop(
 
         match ready {
             Ok(_) => {
-                shared_receiver.write().await.recv().await.expect("Task splitter was dropped").run(worker).await;
+                shared_receiver
+                    .write()
+                    .await
+                    .recv()
+                    .await
+                    .expect("Task splitter was dropped")
+                    .run(worker)
+                    .await;
             }
             Err(duration) => {
                 tokio::time::sleep(duration).await;

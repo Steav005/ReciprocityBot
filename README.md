@@ -12,9 +12,10 @@
     - [ ] Incoming Event Pipeline
     - [ ] Outgoing Task Scheduler
     - [ ] Voice Handler
-- [ ] Event Handler
-    - [ ] Ignore Duplicates
     - [ ] Periodical Check for potentially missed events
+- [x] Event Handler
+    - [x] Ignore Duplicates
+    - [x] Pass Non-Duplicates to GuildHandler
 - [ ] Message Manager
     - [ ] Manage all Bot Messages
 - [ ] Voice Handler
