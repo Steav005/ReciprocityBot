@@ -7,17 +7,27 @@
     - [x] Change Channel ID on the Fly
     - [x] Receive and Distribute Tasks
     - [x] Add All Necessary Tasks 
+    - [x] Log
+    - [x] Comment
 - [ ] Guild Handler
     - [ ] Message Manager
     - [ ] Incoming Event Pipeline
     - [ ] Outgoing Task Scheduler
     - [ ] Voice Handler
     - [ ] Periodical Check for potentially missed events
-- [x] Event Handler
+    - [ ] Log
+    - [ ] Comment
+- [ ] Event Handler
     - [x] Ignore Duplicates
     - [x] Pass Non-Duplicates to GuildHandler
+    - [ ] Log
+    - [x] Comment
 - [ ] Message Manager
     - [ ] Manage all Bot Messages
+    - [ ] Log
+    - [ ] Comment
 - [ ] Voice Handler
     - [ ] Manage Voice Connection
     - [ ] Enqueue Songs
+    - [ ] Log
+    - [ ] Comment

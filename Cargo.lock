@@ -25,6 +25,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0688b520bcc7498f6ca8fa006e8031d353e3fd4f51bd4a50fb03cc4230b28bd2"
+
+[[package]]
 name = "arrayvec"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1538,6 +1544,7 @@ dependencies = [
 name = "reciprocity_bot"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "arrayvec",
  "async-std",
  "futures",
