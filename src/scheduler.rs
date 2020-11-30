@@ -73,18 +73,18 @@ const fn channel_id_message_id_reaction_self(channel: ChannelId, _: GuildId) -> 
 }
 
 ///Task Handler, which will handle the execution, errors and general Task information
-pub struct TaskHandler {
+pub struct TaskHandle {
     pub receiver: Final<OneShotReceiver<Result<(), TaskError>>>,
     sender: OneShotSender<Result<(), TaskError>>,
     pub task: Final<Task>,
 }
 
-impl TaskHandler {
-    ///Builds a TaskHandler from a Task
-    pub fn new(task: Task) -> TaskHandler {
+impl TaskHandle {
+    ///Builds a TaskHandle from a Task
+    pub fn new(task: Task) -> TaskHandle {
         let (sender, receiver) = oneshot::channel();
 
-        TaskHandler {
+        TaskHandle {
             receiver: Final::new(receiver),
             sender,
             task: Final::new(task),
@@ -143,9 +143,9 @@ impl TaskHandler {
 
 ///Schedules Tasks within a Guild
 pub struct TaskScheduler {
-    pub task_sender: Final<MpscSender<TaskHandler>>,
-    pub guild_id: Final<GuildId>,
-    pub channel_id_sender: Final<WatchSender<ChannelId>>,
+    task_sender: Final<MpscSender<TaskHandle>>,
+    guild_id: Final<GuildId>,
+    channel_id_sender: Final<WatchSender<ChannelId>>,
 }
 
 impl TaskScheduler {
@@ -177,6 +177,11 @@ impl TaskScheduler {
         )
     }
 
+    /// Get a Task Sender Clone for enqueuing tasks
+    pub fn get_task_sender(&self) -> MpscSender<TaskHandle>{
+        self.task_sender.t.clone()
+    }
+
     /// Changes the channel_id in case the Bot Channel Changed
     pub fn change_channel_id(&self, channel_id: ChannelId) {
         if self.channel_id_sender.t.send(channel_id).is_err() {
@@ -190,7 +195,7 @@ impl TaskScheduler {
     }
 
     ///Does not Block if the Buffer is full
-    pub fn try_send_task(&self, task: TaskHandler) -> Result<(), ()> {
+    pub fn try_send_task(&self, task: TaskHandle) -> Result<(), ()> {
         if let Err(err) = self.task_sender.try_send(task) {
             match err {
                 TrySendError::Full(task) => {
@@ -209,7 +214,7 @@ impl TaskScheduler {
     }
 
     ///Blocks if the Buffer is full
-    pub async fn send_task(&self, task: TaskHandler) {
+    pub async fn send_task(&self, task: TaskHandle) {
         if self.task_sender.send(task).await.is_err() {
             let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
             error!("{}", &msg);
@@ -220,8 +225,8 @@ impl TaskScheduler {
 
 /// Receive Task and send it to the proper scheduler
 async fn split_receive(
-    mut receiver: MpscReceiver<TaskHandler>,
-    sender: [MpscSender<TaskHandler>; ROUTES.len()],
+    mut receiver: MpscReceiver<TaskHandle>,
+    sender: [MpscSender<TaskHandle>; ROUTES.len()],
     guild_id: GuildId,
 ) {
     loop {
@@ -261,11 +266,11 @@ async fn run_async(
     worker: Vec<&Http>,
     guild_id: GuildId,
     channel_id_receiver: WatchReceiver<ChannelId>,
-    task_receiver: MpscReceiver<TaskHandler>,
+    task_receiver: MpscReceiver<TaskHandle>,
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
     let mut route_senders = ArrayVec::new();
-    let mut route_receivers: ArrayVec<[MpscReceiver<TaskHandler>; ROUTES.len()]> = ArrayVec::new();
+    let mut route_receivers: ArrayVec<[MpscReceiver<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
 
     for _ in 0..ROUTES.len() {
         let (s, r) = mpsc::channel(QUEUE_LIMIT);
@@ -300,7 +305,7 @@ async fn run_async(
 
 //Hosts all Https for this Task
 async fn task_type_scheduler(
-    shared_receiver: MpscReceiver<TaskHandler>,
+    shared_receiver: MpscReceiver<TaskHandle>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
     channel_id: WatchReceiver<ChannelId>,
@@ -325,7 +330,7 @@ async fn task_type_scheduler(
 
 //Makes sure Http is ready for Task, then tries to get one, for executing it
 async fn task_http_loop(
-    shared_receiver: Arc<RwLock<MpscReceiver<TaskHandler>>>,
+    shared_receiver: Arc<RwLock<MpscReceiver<TaskHandle>>>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
     channel_id: WatchReceiver<ChannelId>,

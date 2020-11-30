@@ -7,6 +7,7 @@ mod event_handler;
 mod guild_handler;
 mod scheduler;
 mod structs;
+mod message_manager;
 
 #[tokio::main]
 async fn main() {
