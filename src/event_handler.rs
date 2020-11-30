@@ -8,9 +8,9 @@ use serenity::prelude::*;
 use std::cmp::Eq;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::slice::Iter;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use std::slice::Iter;
 
 const CACHE_DURATION: Duration = Duration::from_millis(900);
 

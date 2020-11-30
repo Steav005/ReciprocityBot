@@ -1,20 +1,20 @@
 #![allow(dead_code)]
 
-use serenity::model::id::{MessageId, ChannelId};
+use crate::event_handler::ReciprocityEventHandler;
 use crate::scheduler::TaskHandle;
-use tokio::sync::mpsc::{Sender as MpscSender, Receiver as MpscReceiver};
 use lavalink_rs::model::UserId;
 use serenity::http::Http;
 use serenity::model::channel::Embed;
-use crate::event_handler::ReciprocityEventHandler;
+use serenity::model::id::{ChannelId, MessageId};
 use std::hash::{Hash, Hasher};
+use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
 
-enum MessageContent{
+enum MessageContent {
     Embed(Vec<Embed>),
     Plain(String),
 }
 
-struct Message<'a>{
+struct Message<'a> {
     id: MessageId,
     sender: (UserId, &'a Http),
     channel: ChannelId,
@@ -22,9 +22,9 @@ struct Message<'a>{
     hash: u64,
 }
 
-impl<'a> Hash for Message<'a>{
+impl<'a> Hash for Message<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let embeds = match &self.content{
+        let embeds = match &self.content {
             MessageContent::Embed(e) => e,
             MessageContent::Plain(msg) => {
                 msg.hash(state);
@@ -32,27 +32,27 @@ impl<'a> Hash for Message<'a>{
             }
         };
 
-        for e in embeds.iter(){
+        for e in embeds.iter() {
             //Skip Author
             e.colour.0.hash(state);
-            if let Some(desc) = &e.description{
+            if let Some(desc) = &e.description {
                 desc.hash(state);
             }
-            for f in e.fields.iter(){
+            for f in e.fields.iter() {
                 f.value.hash(state);
                 f.name.hash(state);
                 f.inline.hash(state);
             }
-            if let Some(foot) = &e.footer{
-                if let Some(icon) = &foot.icon_url{
+            if let Some(foot) = &e.footer {
+                if let Some(icon) = &foot.icon_url {
                     icon.hash(state);
                 }
-                if let Some(proxy) = &foot.proxy_icon_url{
+                if let Some(proxy) = &foot.proxy_icon_url {
                     proxy.hash(state);
                 }
                 foot.text.hash(state);
             }
-            if let Some(img) = &e.image{
+            if let Some(img) = &e.image {
                 img.height.hash(state);
                 img.width.hash(state);
                 img.proxy_url.hash(state);
@@ -60,17 +60,17 @@ impl<'a> Hash for Message<'a>{
             }
             //Skip Kind
             //Skip Provider
-            if let Some(thumb) = &e.thumbnail{
+            if let Some(thumb) = &e.thumbnail {
                 thumb.height.hash(state);
                 thumb.width.hash(state);
                 thumb.proxy_url.hash(state);
                 thumb.url.hash(state);
             }
             //Skip Timestamp
-            if let Some(title) = &e.title{
+            if let Some(title) = &e.title {
                 title.hash(state);
             }
-            if let Some(url) = &e.url{
+            if let Some(url) = &e.url {
                 url.hash(state);
             }
             //Skip Video
@@ -78,28 +78,32 @@ impl<'a> Hash for Message<'a>{
     }
 }
 
-impl<'a> Message<'a>{
+impl<'a> Message<'a> {
     async fn update(&mut self) -> Result<(), ()> {
         unimplemented!();
     }
 }
 
-impl<'a> PartialEq for Message<'a>{
+impl<'a> PartialEq for Message<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
     }
 }
 
-pub struct MessageManager<'a>{
+pub struct MessageManager<'a> {
     task_handler: MpscSender<TaskHandle>,
     event_handler: ReciprocityEventHandler,
     player: Vec<Message<'a>>,
-    bots: Vec<(UserId, &'a Http)>
+    bots: Vec<(UserId, &'a Http)>,
 }
 
-impl<'a> MessageManager<'a>{
-    pub fn new(bots: Vec<(UserId, &'a Http)>, task_handler: MpscSender<TaskHandle>, event_handler: ReciprocityEventHandler) -> Self{
-        MessageManager{
+impl<'a> MessageManager<'a> {
+    pub fn new(
+        bots: Vec<(UserId, &'a Http)>,
+        task_handler: MpscSender<TaskHandle>,
+        event_handler: ReciprocityEventHandler,
+    ) -> Self {
+        MessageManager {
             task_handler,
             event_handler,
             player: Vec::new(),

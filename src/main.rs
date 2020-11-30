@@ -5,9 +5,9 @@ use serenity::Client;
 
 mod event_handler;
 mod guild_handler;
+mod message_manager;
 mod scheduler;
 mod structs;
-mod message_manager;
 
 #[tokio::main]
 async fn main() {

@@ -178,7 +178,7 @@ impl TaskScheduler {
     }
 
     /// Get a Task Sender Clone for enqueuing tasks
-    pub fn get_task_sender(&self) -> MpscSender<TaskHandle>{
+    pub fn get_task_sender(&self) -> MpscSender<TaskHandle> {
         self.task_sender.t.clone()
     }
 
