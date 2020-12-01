@@ -1,16 +1,22 @@
 #![allow(dead_code)]
 
-use async_std::sync::Arc;
 use serenity::async_trait;
 use serenity::model::channel::{Message, Reaction, ReactionType};
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
 use std::cmp::Eq;
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, RandomState};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::slice::Iter;
-use tokio::sync::{Mutex, RwLock};
-use tokio::time::{Duration, Instant};
+use log::{info, debug, error, warn};
+use std::time::{Duration, Instant};
+use std::sync::Arc;
+use smol::lock::{Mutex, RwLock};
+use futures::stream::Stream;
+use smol::channel::Sender;
+use smol::channel;
+
+//TODO maybe use combination of ArcSwap and a Mutex for the EventHandler Configuration
 
 const CACHE_DURATION: Duration = Duration::from_millis(900);
 
@@ -25,11 +31,12 @@ impl Cache {
     /// Adds Event to Cache
     /// Returns Err(Event) if Event is already present in Cache
     pub async fn try_add(&self, event: Event) -> Result<(), Event> {
-        let mut cache = self.0.lock().await;
+        let mut cache = self.0.lock_arc().await;
         if self.contains(&event, &mut *cache) {
             return Err(event);
         }
 
+        info!("Adding Event to Cache: {:?}", event);
         cache.push_back(CachedEvent::new(event));
         Ok(())
     }
@@ -51,6 +58,7 @@ impl Cache {
                 Some(c_event) => {
                     //It is elapsed: pop and try for the next item in the queue
                     if c_event.elapsed() {
+                        info!("Removing Event from Cache: {:?}", c_event);
                         cache.pop_front();
                     } else {
                         //Else return because no other event can be elapsed
@@ -63,6 +71,7 @@ impl Cache {
 }
 
 /// Represents an Event inside the Cache
+#[derive(Debug)]
 struct CachedEvent {
     event: Event,
     now: Instant,
@@ -84,7 +93,7 @@ impl CachedEvent {
 }
 
 /// Events that are kept inside the Cache
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, PartialEq, Clone, Debug)]
 pub enum Event {
     /// If a new Message was send
     NewMessage(MessageId),
@@ -101,7 +110,7 @@ type EventHandlerConfigType = Arc<
         HashMap<
             ChannelId,
             (
-                Arc<dyn ReciprocityGuildEventHandler + Send + Sync>,
+                Sender<Event>,
                 Arc<RwLock<HashSet<MessageId>>>,
             ),
         >,
@@ -110,6 +119,7 @@ type EventHandlerConfigType = Arc<
 
 type Error = ReciprocityEventHandlerError;
 /// Errors that can occur while trying to change the Configuration
+#[derive(Debug)]
 pub enum ReciprocityEventHandlerError {
     /// If the given Channel does not exist in the Config
     ChannelDoesNotExist,
@@ -141,7 +151,8 @@ impl ReciprocityEventHandler {
     /// Handles an event by trying to add it to the cache and if it does not exist already, sending it to the handler
     async fn handle_event(
         &self,
-        handler: Arc<dyn ReciprocityGuildEventHandler + Send + Sync>,
+        handler: Sender<Event>,
+        channel: ChannelId,
         event: Event,
     ) {
         // Check if this Event was already handled
@@ -150,7 +161,12 @@ impl ReciprocityEventHandler {
         }
 
         // Handle Event in Guild
-        handler.handle(event).await;
+        if let Err(err) = handler.send(event).await{
+            warn!("Receiver for {:?}, were dropped. Removing Guild. {:?}", channel, err);
+            if let Err(err) = self.remove_guild(channel).await{
+                warn!("Guild for {:?}, was already removed. {:?}", channel, err);
+            };
+        };
     }
 
     /// Processes new Message Event
@@ -161,7 +177,7 @@ impl ReciprocityEventHandler {
             Some((handler, _)) => handler.clone(),
         };
 
-        self.handle_event(handler, Event::NewMessage(msg.id)).await;
+        self.handle_event(handler, msg.channel_id, Event::NewMessage(msg.id)).await;
     }
 
     /// Processes delete Message Event
@@ -177,13 +193,24 @@ impl ReciprocityEventHandler {
             return;
         }
 
-        self.handle_event(handler, Event::DeletedMessage(msg)).await;
+        self.handle_event(handler, channel, Event::DeletedMessage(msg)).await;
+    }
+
+    fn extract_user(reaction: &Reaction) -> UserId{
+        match reaction.user_id{
+            None => {
+                let msg = format!("No User in Reaction Event. {:?}", reaction);
+                error!("{}", &msg);
+                panic!(msg)
+            }
+            Some(user) => user,
+        }
     }
 
     /// Processes new Reaction Event
     pub async fn process_event_reaction_added(&self, reaction: Reaction) {
         //Make sure we got a user along the reaction event
-        let user = reaction.user_id.expect("No User in Reaction");
+        let user = ReciprocityEventHandler::extract_user(&reaction);
 
         //Check if the channel is relevant
         let (handler, messages) = match self.channels.read().await.get(&reaction.channel_id) {
@@ -198,6 +225,7 @@ impl ReciprocityEventHandler {
 
         self.handle_event(
             handler,
+            reaction.channel_id,
             Event::AddedReaction(reaction.message_id, user, reaction.emoji),
         )
         .await;
@@ -206,10 +234,10 @@ impl ReciprocityEventHandler {
     /// Processes delete Reaction Event
     pub async fn process_event_reaction_removed(&self, reaction: Reaction) {
         //Make sure we got a user along the reaction event
-        let user = reaction.user_id.expect("No User in Reaction");
+        let user = ReciprocityEventHandler::extract_user(&reaction);
 
         //Check if the channel is relevant
-        let (handler, messages) = match self.channels.read().await.get(&reaction.channel_id) {
+        let (sender, messages) = match self.channels.read().await.get(&reaction.channel_id) {
             None => return,
             Some(info) => info.clone(),
         };
@@ -220,7 +248,8 @@ impl ReciprocityEventHandler {
         }
 
         self.handle_event(
-            handler,
+            sender,
+            reaction.channel_id,
             Event::RemovedReaction(reaction.message_id, user, reaction.emoji),
         )
         .await;
@@ -230,25 +259,41 @@ impl ReciprocityEventHandler {
     pub async fn add_guild(
         &self,
         channel: ChannelId,
-        handler: Arc<dyn ReciprocityGuildEventHandler + Send + Sync>,
-    ) -> Result<(), Error> {
+    ) -> Result<Box<dyn Stream<Item = Event>>, Error> {
+        let (sender, receiver) = channel::unbounded();
+
+        debug!("Adding Guild with {:?}", channel);
         match self.channels.write().await.entry(channel) {
             Entry::Occupied(_) => Err(Error::ChannelAlreadyExists),
             Entry::Vacant(entry) => {
-                entry.insert((handler, Arc::new(RwLock::new(HashSet::new()))));
-                Ok(())
+                entry.insert((sender, Arc::new(RwLock::new(HashSet::new()))));
+                Ok(Box::new(receiver))
             }
         }
     }
 
     /// Remove Guild from the handled Events, by ChannelID
     pub async fn remove_guild(&self, channel: ChannelId) -> Result<(), Error> {
+        debug!("Removing Guild with {:?}", channel);
         match self.channels.write().await.entry(channel) {
             Entry::Occupied(entry) => {
                 entry.remove();
                 Ok(())
             }
-            Entry::Vacant(_) => Err(Error::ChannelDoesNotExist),
+            Entry::Vacant(_) => {
+                debug!("Channel didn't exist. {:?}", channel);
+                Err(Error::ChannelDoesNotExist)
+            },
+        }
+    }
+
+    async fn get_channel(&self, channel: ChannelId) -> Result<Arc<RwLock<HashSet<MessageId, RandomState>>>, Error>{
+        match self.channels.read().await.get(&channel) {
+            None => {
+                debug!("Channel didn't exist. {:?}", channel);
+                Err(Error::ChannelDoesNotExist)
+            },
+            Some((_, messages)) => Ok(messages.clone()),
         }
     }
 
@@ -258,15 +303,16 @@ impl ReciprocityEventHandler {
         channel: ChannelId,
         message: MessageId,
     ) -> Result<(), Error> {
-        let messages = match self.channels.read().await.get(&channel) {
-            None => return Err(Error::ChannelDoesNotExist),
-            Some((_, messages)) => messages.clone(),
-        };
+        debug!("Removing {:?}, from {:?}", message, channel);
+        let messages = self.get_channel(channel).await?;
 
         let mut messages = messages.write().await;
         match messages.remove(&message) {
             true => Ok(()),
-            false => Err(Error::MessageDoesNotExist),
+            false => {
+                debug!("Message {:?}, didn't exist in {:?}", message, channel);
+                Err(Error::MessageDoesNotExist)
+            },
         }
     }
 
@@ -276,14 +322,14 @@ impl ReciprocityEventHandler {
         channel: ChannelId,
         remove_messages: Iter<'_, MessageId>,
     ) -> Result<(), Error> {
-        let messages = match self.channels.read().await.get(&channel) {
-            None => return Err(Error::ChannelDoesNotExist),
-            Some((_, messages)) => messages.clone(),
-        };
+        debug!("Removing {:?}, from {:?}", remove_messages, channel);
+        let messages = self.get_channel(channel).await?;
 
         let mut messages = messages.write().await;
         for m in remove_messages {
-            messages.remove(m);
+            if !messages.remove(m){
+                debug!("Message {:?}, didn't exist in {:?}", m, channel);
+            };
         }
 
         Ok(())
@@ -291,15 +337,16 @@ impl ReciprocityEventHandler {
 
     /// Add Message to handles Messages
     pub async fn add_message(&self, channel: ChannelId, message: MessageId) -> Result<(), Error> {
-        let messages = match self.channels.read().await.get(&channel) {
-            None => return Err(Error::ChannelDoesNotExist),
-            Some((_, messages)) => messages.clone(),
-        };
+        debug!("Adding {:?}, to {:?}", message, channel);
+        let messages = self.get_channel(channel).await?;
 
         let mut messages = messages.write().await;
         match messages.insert(message) {
             true => Ok(()),
-            false => Err(Error::MessageAlreadyExists),
+            false => {
+                debug!("Message {:?}, already exists in {:?}", message, channel);
+                Err(Error::MessageAlreadyExists)
+            },
         }
     }
 
@@ -309,6 +356,7 @@ impl ReciprocityEventHandler {
         channel: ChannelId,
         add_messages: Iter<'_, MessageId>,
     ) -> Result<(), Error> {
+        debug!("Adding {:?}, to {:?}", add_messages, channel);
         let messages = match self.channels.read().await.get(&channel) {
             None => return Err(Error::ChannelDoesNotExist),
             Some((_, messages)) => messages.clone(),
@@ -316,7 +364,9 @@ impl ReciprocityEventHandler {
 
         let mut messages = messages.write().await;
         for m in add_messages {
-            messages.insert(*m);
+            if !messages.insert(*m){
+                debug!("Message {:?}, already exists in {:?}", m, channel);
+            };
         }
 
         Ok(())
@@ -324,10 +374,8 @@ impl ReciprocityEventHandler {
 
     /// Remove all Messages from handled Messages
     async fn clear_messages(&self, channel: ChannelId) -> Result<(), Error> {
-        let messages = match self.channels.read().await.get(&channel) {
-            None => return Err(Error::ChannelDoesNotExist),
-            Some((_, messages)) => messages.clone(),
-        };
+        debug!("Clear Messages from {:?}", channel);
+        let messages = self.get_channel(channel).await?;
 
         let mut messages = messages.write().await;
         messages.clear();
@@ -340,12 +388,19 @@ impl ReciprocityEventHandler {
         old_channel: ChannelId,
         new_channel: ChannelId,
     ) -> Result<(), Error> {
+        debug!("Changing {:?}, to {:?}", old_channel, new_channel);
         let mut channels = self.channels.write().await;
         match channels.contains_key(&new_channel) {
-            true => return Err(Error::ChannelAlreadyExists),
+            true => {
+                debug!("Channel already exists. {:?}", new_channel);
+                return Err(Error::ChannelAlreadyExists);
+            },
             false => {
                 let value = match channels.entry(old_channel) {
-                    Entry::Vacant(_) => return Err(Error::ChannelDoesNotExist),
+                    Entry::Vacant(_) => {
+                        debug!("Channel does not exist. {:?}", old_channel);
+                        return Err(Error::ChannelDoesNotExist);
+                    },
                     Entry::Occupied(entry) => entry.remove(),
                 };
                 channels.insert(new_channel, value);
@@ -377,10 +432,4 @@ impl EventHandler for ReciprocityEventHandler {
     async fn reaction_remove(&self, _: Context, reaction: Reaction) {
         self.process_event_reaction_removed(reaction).await;
     }
-}
-
-/// Trait required of GuildEventHandlers
-#[async_trait]
-pub trait ReciprocityGuildEventHandler {
-    async fn handle(&self, event: Event);
 }

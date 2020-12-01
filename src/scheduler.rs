@@ -2,9 +2,9 @@
 
 use crate::scheduler::TaskError::FailedExecution;
 use arrayvec::ArrayVec;
-use async_std::sync::Arc;
+use std::sync::Arc;
 use futures::prelude::*;
-use log::{debug, error, warn};
+use log::{info, debug, error, warn};
 use serenity::http::routing::Route;
 use serenity::http::Http;
 use serenity::model::channel::ReactionType;
@@ -12,11 +12,9 @@ use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::SerenityError;
 use std::ops::Deref;
 use std::pin::Pin;
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
-use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender};
-use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
-use tokio::sync::{mpsc, oneshot, watch, RwLock};
+use smol::channel::{Receiver, Sender, TrySendError};
+use smol::channel;
+use arc_swap::ArcSwap;
 
 const QUEUE_LIMIT: usize = 1000;
 
@@ -47,6 +45,7 @@ pub enum TaskError {
 }
 
 ///The Tasks, that can be enqueued
+#[derive(Debug)]
 pub enum Task {
     DeleteMessageReaction(ChannelId, MessageId, UserId, ReactionType),
     DeleteMessage(ChannelId, MessageId),
@@ -74,25 +73,24 @@ const fn channel_id_message_id_reaction_self(channel: ChannelId, _: GuildId) -> 
 
 ///Task Handler, which will handle the execution, errors and general Task information
 pub struct TaskHandle {
-    pub receiver: Final<OneShotReceiver<Result<(), TaskError>>>,
-    sender: OneShotSender<Result<(), TaskError>>,
+    receiver: Receiver<Result<(), TaskError>>,
+    sender: Sender<Result<(), TaskError>>,
     pub task: Final<Task>,
 }
 
 impl TaskHandle {
     ///Builds a TaskHandle from a Task
     pub fn new(task: Task) -> TaskHandle {
-        let (sender, receiver) = oneshot::channel();
-
+        let (sender, receiver) = channel::bounded(1);
         TaskHandle {
-            receiver: Final::new(receiver),
+            receiver,
             sender,
             task: Final::new(task),
         }
     }
 
     ///Tries to complete the Task with the help of an Http Instance
-    pub async fn run(self, client: &Http) {
+    async fn run(self, client: &Http) {
         let result: Result<(), TaskError> = match self.task.deref() {
             Task::DeleteMessageReaction(channel, message, user, reaction) => client
                 .delete_reaction(channel.0, message.0, Some(user.0), reaction)
@@ -107,23 +105,30 @@ impl TaskHandle {
                 .await
                 .map_err(FailedExecution),
         };
-
-        if let Err(err) = self.sender.send(result) {
-            debug!("Task Error Result was dropped: {:?}", err);
+        info!("Run {:?}, with client(token): {:?}, {:?}", self.task.t, client.token, result);
+        if let Err(err) = self.sender.try_send(result) {
+            debug!("Task Error Result was dropped: {:?}", err.into_inner());
         }
     }
 
     ///Drops the Task/TaskHandler
-    pub fn drop(self) {
-        if let Err(err) = self.sender.send(Err(TaskError::Dropped())) {
-            debug!("Task Error was dropped: {:?}", err.unwrap_err())
+    fn drop(self) {
+        info!("Dropping Task: {:?}", self.task.t);
+        if let Err(err) = self.sender.try_send(Err(TaskError::Dropped())) {
+            debug!("Task Error was dropped: {:?}", err.into_inner().unwrap_err())
         }
     }
 
-    pub fn drop_no_bot(self) {
-        if let Err(err) = self.sender.send(Err(TaskError::BotDoesNotExist())) {
-            debug!("Task Error was dropped: {:?}", err.unwrap_err())
+    fn drop_no_bot(self) {
+        info!("Dropping {:?}, Reason: No Bot Exists", self.task.t);
+        if let Err(err) = self.sender.try_send(Err(TaskError::BotDoesNotExist())) {
+            debug!("Task Error was dropped: {:?}", err.into_inner().unwrap_err())
         }
+    }
+
+    /// Await Task completion
+    pub async fn complete(&self) -> Result<(), TaskError>{
+        self.receiver.recv().await.expect("Unexpectedly Dropped")
     }
 
     ///Returns the Route, the underlying Task requires
@@ -143,9 +148,9 @@ impl TaskHandle {
 
 ///Schedules Tasks within a Guild
 pub struct TaskScheduler {
-    task_sender: Final<MpscSender<TaskHandle>>,
+    task_sender: Sender<TaskHandle>,
     guild_id: Final<GuildId>,
-    channel_id_sender: Final<WatchSender<ChannelId>>,
+    channel_id: Arc<ArcSwap<ChannelId>>,
 }
 
 impl TaskScheduler {
@@ -155,13 +160,14 @@ impl TaskScheduler {
         channel_id: ChannelId,
         worker: Vec<&'a Http>,
     ) -> (Self, Pin<Box<dyn Future<Output = ()> + 'a>>) {
-        let (task_sender, task_receiver) = mpsc::channel(QUEUE_LIMIT);
-        let (channel_id_sender, channel_id_receiver) = watch::channel(channel_id);
+        let (task_sender, task_receiver) = channel::bounded(QUEUE_LIMIT);
+
+        let channel_id = Arc::new(ArcSwap::from(Arc::new(channel_id)));
 
         let scheduler = TaskScheduler {
-            task_sender: Final::new(task_sender),
+            task_sender,
             guild_id: Final::new(guild_id),
-            channel_id_sender: Final::new(channel_id_sender),
+            channel_id: channel_id.clone(),
         };
 
         (
@@ -171,40 +177,35 @@ impl TaskScheduler {
             Box::pin(run_async(
                 worker,
                 guild_id,
-                channel_id_receiver,
+                channel_id,
                 task_receiver,
             )),
         )
     }
 
     /// Get a Task Sender Clone for enqueuing tasks
-    pub fn get_task_sender(&self) -> MpscSender<TaskHandle> {
-        self.task_sender.t.clone()
+    pub fn get_task_sender(&self) -> Sender<TaskHandle> {
+        self.task_sender.clone()
     }
 
     /// Changes the channel_id in case the Bot Channel Changed
     pub fn change_channel_id(&self, channel_id: ChannelId) {
-        if self.channel_id_sender.t.send(channel_id).is_err() {
-            let msg = format!(
-                "Channel Change Receiver dropped. Guild: {:?}",
-                self.guild_id.t
-            );
-            error!("{}", &msg);
-            panic!(msg)
-        }
+        debug!("Changing Channel ID for {:?}, to {:?}", self.guild_id.t, channel_id);
+        self.channel_id.swap(Arc::new(channel_id));
     }
 
     ///Does not Block if the Buffer is full
     pub fn try_send_task(&self, task: TaskHandle) -> Result<(), ()> {
+        info!("Try Sending {:?}, to {:?}", task.task.t, self.guild_id.t);
         if let Err(err) = self.task_sender.try_send(task) {
             match err {
                 TrySendError::Full(task) => {
-                    warn!("Buffer Full. Guild: {:?}", self.guild_id.t);
+                    warn!("Buffer Full. {:?}", self.guild_id.t);
                     task.drop();
                     return Err(());
                 }
                 TrySendError::Closed(_) => {
-                    let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
+                    let msg = format!("Task Receiver dropped. {:?}", self.guild_id.t);
                     error!("{}", &msg);
                     panic!(msg)
                 }
@@ -216,7 +217,7 @@ impl TaskScheduler {
     ///Blocks if the Buffer is full
     pub async fn send_task(&self, task: TaskHandle) {
         if self.task_sender.send(task).await.is_err() {
-            let msg = format!("Task Receiver dropped. Guild: {:?}", self.guild_id.t);
+            let msg = format!("Task Receiver dropped. {:?}", self.guild_id.t);
             error!("{}", &msg);
             panic!(msg)
         };
@@ -225,18 +226,18 @@ impl TaskScheduler {
 
 /// Receive Task and send it to the proper scheduler
 async fn split_receive(
-    mut receiver: MpscReceiver<TaskHandle>,
-    sender: [MpscSender<TaskHandle>; ROUTES.len()],
+    receiver: Receiver<TaskHandle>,
+    sender: [Sender<TaskHandle>; ROUTES.len()],
     guild_id: GuildId,
 ) {
     loop {
         let task = match receiver.recv().await {
-            None => {
-                let msg = format!("Task Sender dropped. Guild: {:?}", guild_id);
+            Err(err) => {
+                let msg = format!("{:?}, {:?}", err, guild_id);
                 error!("{}", &msg);
                 panic!(msg);
             }
-            Some(task) => task,
+            Ok(task) => task,
         };
         let route_id = task.get_route_id();
 
@@ -244,14 +245,14 @@ async fn split_receive(
             match err {
                 TrySendError::Full(task) => {
                     warn!(
-                        "Buffer Full. Guild: {:?}, RouteID: {:?}",
+                        "Buffer Full. {:?}, RouteID: {:?}",
                         guild_id, route_id
                     );
                     task.drop();
                 }
                 TrySendError::Closed(_) => {
                     let msg = format!(
-                        "Task Receiver dropped. Guild: {:?}, RouteID: {:?}",
+                        "Task Receiver dropped. {:?}, RouteID: {:?}",
                         guild_id, route_id
                     );
                     error!("{}", &msg);
@@ -265,15 +266,15 @@ async fn split_receive(
 async fn run_async(
     worker: Vec<&Http>,
     guild_id: GuildId,
-    channel_id_receiver: WatchReceiver<ChannelId>,
-    task_receiver: MpscReceiver<TaskHandle>,
+    channel_id: Arc<ArcSwap<ChannelId>>,
+    task_receiver: Receiver<TaskHandle>,
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
-    let mut route_senders = ArrayVec::new();
-    let mut route_receivers: ArrayVec<[MpscReceiver<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
+    let mut route_senders: ArrayVec<[Sender<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
+    let mut route_receivers: ArrayVec<[Receiver<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
 
     for _ in 0..ROUTES.len() {
-        let (s, r) = mpsc::channel(QUEUE_LIMIT);
+        let (s, r) = channel::bounded(QUEUE_LIMIT);
         route_senders.push(s);
         route_receivers.push(r);
     }
@@ -292,7 +293,7 @@ async fn run_async(
             route_receivers.pop_at(0).expect("Not enough Receivers"),
             *route,
             guild_id,
-            channel_id_receiver.clone(),
+            &channel_id,
             worker.clone(),
         )))
     }
@@ -305,21 +306,20 @@ async fn run_async(
 
 //Hosts all Https for this Task
 async fn task_type_scheduler(
-    shared_receiver: MpscReceiver<TaskHandle>,
+    shared_receiver: Receiver<TaskHandle>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
-    channel_id: WatchReceiver<ChannelId>,
+    channel_id: &ArcSwap<ChannelId>,
     worker: Vec<&Http>,
 ) {
     let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
-    let shared_receiver = Arc::new(RwLock::new(shared_receiver));
 
     for w in worker.iter() {
         pool.push(Box::pin(task_http_loop(
             shared_receiver.clone(),
             route,
             guild_id,
-            channel_id.clone(),
+            channel_id,
             w,
         )));
     }
@@ -330,22 +330,22 @@ async fn task_type_scheduler(
 
 //Makes sure Http is ready for Task, then tries to get one, for executing it
 async fn task_http_loop(
-    shared_receiver: Arc<RwLock<MpscReceiver<TaskHandle>>>,
+    shared_receiver: Receiver<TaskHandle>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
-    channel_id: WatchReceiver<ChannelId>,
+    channel_id: &ArcSwap<ChannelId>,
     worker: &Http,
 ) {
     loop {
         let ready = {
             let routes_map = worker.ratelimiter.routes();
             let routes_map = routes_map.read().await;
-            let channel_id = *channel_id.borrow();
+            let channel_id = **channel_id.load();
             let target_route = route(channel_id, guild_id);
             let rate_limit = match routes_map.get(&target_route) {
                 None => {
                     let msg = format!(
-                        "Couldn't get Rate Limit for Route: {:?}. Guild: {:?}, Channel: {:?}",
+                        "Couldn't get Rate Limit for {:?}. {:?}, {:?}",
                         target_route, guild_id, channel_id
                     );
                     error!("{}", &msg);
@@ -374,8 +374,6 @@ async fn task_http_loop(
         match ready {
             Ok(_) => {
                 shared_receiver
-                    .write()
-                    .await
                     .recv()
                     .await
                     .expect("Task splitter was dropped")
@@ -383,7 +381,7 @@ async fn task_http_loop(
                     .await;
             }
             Err(duration) => {
-                tokio::time::sleep(duration).await;
+                smol::Timer::after(duration).await;
             }
         }
     }

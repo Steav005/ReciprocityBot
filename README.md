@@ -3,11 +3,11 @@
 
 ## Features
 
-- [x] Task Scheduler
+- [ ] Task Scheduler
     - [x] Change Channel ID on the Fly
     - [x] Receive and Distribute Tasks
     - [x] Add All Necessary Tasks 
-    - [x] Log
+    - [ ] Log (info, debug, warn, error)
     - [x] Comment
 - [ ] Guild Handler
     - [ ] Message Manager
@@ -15,19 +15,21 @@
     - [ ] Outgoing Task Scheduler
     - [ ] Voice Handler
     - [ ] Periodical Check for potentially missed events
-    - [ ] Log
+    - [ ] Log (info, debug, warn, error)
     - [ ] Comment
 - [ ] Event Handler
     - [x] Ignore Duplicates
     - [x] Pass Non-Duplicates to GuildHandler
-    - [ ] Log
+    - [ ] Rethink EventHandler Config
+    - [x] Log
     - [x] Comment
 - [ ] Message Manager
     - [ ] Manage all Bot Messages
-    - [ ] Log
+    - [ ] Log (info, debug, warn, error)
     - [ ] Comment
 - [ ] Voice Handler
     - [ ] Manage Voice Connection
     - [ ] Enqueue Songs
-    - [ ] Log
+    - [ ] Log (info, debug, warn, error)
     - [ ] Comment
+- [x] Moved to Smol

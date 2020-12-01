@@ -7,7 +7,7 @@ use serenity::http::Http;
 use serenity::model::channel::Embed;
 use serenity::model::id::{ChannelId, MessageId};
 use std::hash::{Hash, Hasher};
-use tokio::sync::mpsc::{Receiver as MpscReceiver, Sender as MpscSender};
+use smol::channel::{Receiver, Sender};
 
 enum MessageContent {
     Embed(Vec<Embed>),
@@ -91,7 +91,7 @@ impl<'a> PartialEq for Message<'a> {
 }
 
 pub struct MessageManager<'a> {
-    task_handler: MpscSender<TaskHandle>,
+    task_handler: Sender<TaskHandle>,
     event_handler: ReciprocityEventHandler,
     player: Vec<Message<'a>>,
     bots: Vec<(UserId, &'a Http)>,
@@ -100,7 +100,7 @@ pub struct MessageManager<'a> {
 impl<'a> MessageManager<'a> {
     pub fn new(
         bots: Vec<(UserId, &'a Http)>,
-        task_handler: MpscSender<TaskHandle>,
+        task_handler: Sender<TaskHandle>,
         event_handler: ReciprocityEventHandler,
     ) -> Self {
         MessageManager {

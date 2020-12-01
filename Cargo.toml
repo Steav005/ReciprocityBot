@@ -10,9 +10,8 @@ edition = "2018"
 arrayvec = "^0.5.2"
 log = "^0.4.11"
 futures = "^0.3.8"
-tokio = { version = "^0.3.3", features = ["full"] }
-async-std = "^1.7.0"
-arc-swap = "1.0.0"
+smol =  "^1.2.5"
+arc-swap = "^1.0.0"
 
 serenity = { version = "^0.9.1", default-features = false, features = ["client", "gateway", "model", "rustls_backend"]}
 songbird = {git = "https://github.com/serenity-rs/songbird", branch = "current", features = ["serenity-native", "gateway"]}
