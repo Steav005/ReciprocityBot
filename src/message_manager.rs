@@ -1,28 +1,34 @@
 #![allow(dead_code)]
 
-use crate::event_handler::ReciprocityEventHandler;
 use crate::scheduler::TaskHandle;
-use lavalink_rs::model::UserId;
+use crate::voice_handler::VoiceTask;
+use async_compat::CompatExt;
+use futures::{Future, FutureExt, Stream};
 use serenity::http::Http;
 use serenity::model::channel::Embed;
-use serenity::model::id::{ChannelId, MessageId};
-use std::hash::{Hash, Hasher};
+use serenity::model::id::{ChannelId, MessageId, UserId};
 use smol::channel::{Receiver, Sender};
+use std::hash::{Hash, Hasher};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use thiserror::Error;
 
 enum MessageContent {
     Embed(Vec<Embed>),
     Plain(String),
 }
 
-struct Message<'a> {
+struct Message {
     id: MessageId,
-    sender: (UserId, &'a Http),
+    sender: (UserId, Arc<Http>),
     channel: ChannelId,
     content: MessageContent,
+    timeout: Option<Duration>,
     hash: u64,
 }
 
-impl<'a> Hash for Message<'a> {
+impl Hash for Message {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let embeds = match &self.content {
             MessageContent::Embed(e) => e,
@@ -78,36 +84,49 @@ impl<'a> Hash for Message<'a> {
     }
 }
 
-impl<'a> Message<'a> {
+impl Message {
     async fn update(&mut self) -> Result<(), ()> {
         unimplemented!();
     }
 }
 
-impl<'a> PartialEq for Message<'a> {
+impl PartialEq for Message {
     fn eq(&self, other: &Self) -> bool {
         self.hash == other.hash
     }
 }
 
-pub struct MessageManager<'a> {
+pub struct MessageManager {
+    //event_stream: Receiver<Event>,
     task_handler: Sender<TaskHandle>,
-    event_handler: ReciprocityEventHandler,
-    player: Vec<Message<'a>>,
-    bots: Vec<(UserId, &'a Http)>,
+    //voice_handler: Sender<VoiceTask>,
+    player: Vec<Message>,
+    bots: Vec<(UserId, Arc<Http>)>,
 }
 
-impl<'a> MessageManager<'a> {
+impl MessageManager {
     pub fn new(
-        bots: Vec<(UserId, &'a Http)>,
+        bots: Vec<(UserId, Arc<Http>)>,
+        //event_stream: Receiver<Event>,
         task_handler: Sender<TaskHandle>,
-        event_handler: ReciprocityEventHandler,
-    ) -> Self {
-        MessageManager {
-            task_handler,
-            event_handler,
-            player: Vec::new(),
-            bots,
-        }
+        //voice_handler: Sender<VoiceTask>,
+    ) -> (Self, Pin<Box<dyn Future<Output = MessageManagerError>>>) {
+        (
+            MessageManager {
+                //event_stream,
+                task_handler,
+                //voice_handler,
+                player: Vec::new(),
+                bots,
+            },
+            run_async().boxed_local(),
+        )
     }
+}
+
+#[derive(Debug, Error)]
+pub enum MessageManagerError {}
+
+async fn run_async() -> MessageManagerError {
+    todo!()
 }

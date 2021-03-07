@@ -1,0 +1,13 @@
+bots:
+  misaka: secret_token
+  miku: secret_token2
+guilds:
+  fipponarci:
+    guild_id: 11
+    channel_id: 12
+  ffp:
+    guild_id: 21
+    channel_id: 22
+lavalink:
+  address: "lavalink.autumnal.de"
+  password: "password"

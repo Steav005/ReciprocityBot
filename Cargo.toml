@@ -8,11 +8,20 @@ edition = "2018"
 
 [dependencies]
 arrayvec = "^0.5.2"
-log = "^0.4.11"
-futures = "^0.3.8"
+log = "^0.4.14"
+futures = "^0.3.13"
 smol =  "^1.2.5"
-arc-swap = "^1.0.0"
+arc-swap = "^1.2.0"
+async-compat = "^0.2.0"
+anyhow = "^1.0.38"
+thiserror = "^1.0.24"
+serde_json = "^1.0.64"
+serde_yaml = "^0.8.17"
+serde = { version = "^1.0", features = ["derive"] }
+arraydeque = "^0.4.5"
+heapless = "^0.6.1"
+easy-parallel = "^3.1.0"
 
-serenity = { version = "^0.9.1", default-features = false, features = ["client", "gateway", "model", "rustls_backend"]}
-songbird = {git = "https://github.com/serenity-rs/songbird", branch = "current", features = ["serenity-native", "gateway"]}
-lavalink-rs = {git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "songbird"}
+serenity = { version = "^0.10.2", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
+songbird = { version = "^0.1.3", default-features = false, features = ["serenity-rustls", "gateway"]}
+lavalink-rs = {git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}

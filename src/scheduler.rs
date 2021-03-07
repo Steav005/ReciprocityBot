@@ -1,20 +1,23 @@
 #![allow(dead_code)]
 
 use crate::scheduler::TaskError::FailedExecution;
+use arc_swap::ArcSwap;
 use arrayvec::ArrayVec;
-use std::sync::Arc;
+use async_compat::CompatExt;
 use futures::prelude::*;
-use log::{info, debug, error, warn};
+use log::{debug, error, info, warn};
+use serde_json::Value as SerdeValue;
 use serenity::http::routing::Route;
 use serenity::http::Http;
 use serenity::model::channel::ReactionType;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::SerenityError;
+use smol::channel;
+use smol::channel::{Receiver, RecvError, Sender, TrySendError};
 use std::ops::Deref;
 use std::pin::Pin;
-use smol::channel::{Receiver, Sender, TrySendError};
-use smol::channel;
-use arc_swap::ArcSwap;
+use std::sync::Arc;
+use thiserror::Error;
 
 const QUEUE_LIMIT: usize = 1000;
 
@@ -37,10 +40,13 @@ impl<T> Deref for Final<T> {
 }
 
 ///Any Error that can be returned by any "enqueued" Task
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TaskError {
+    #[error("Execution of the Task failed: Serenity Error: {0:?}")]
     FailedExecution(SerenityError),
+    #[error("The requested Bot does not exists")]
     BotDoesNotExist(),
+    #[error("The Task was dropped before execution")]
     Dropped(),
 }
 
@@ -50,6 +56,7 @@ pub enum Task {
     DeleteMessageReaction(ChannelId, MessageId, UserId, ReactionType),
     DeleteMessage(ChannelId, MessageId),
     AddMessageReaction(ChannelId, MessageId, ReactionType),
+    SendDM(ChannelId, String),
 }
 
 ///All the Routes which will be used by any Task
@@ -90,22 +97,35 @@ impl TaskHandle {
     }
 
     ///Tries to complete the Task with the help of an Http Instance
-    async fn run(self, client: &Http) {
+    async fn run(self, client: Arc<Http>) {
         let result: Result<(), TaskError> = match self.task.deref() {
+            //ALWAYS USE COMPAT
             Task::DeleteMessageReaction(channel, message, user, reaction) => client
                 .delete_reaction(channel.0, message.0, Some(user.0), reaction)
+                .compat()
                 .await
                 .map_err(FailedExecution),
             Task::DeleteMessage(channel, message) => client
                 .delete_message(channel.0, message.0)
+                .compat()
                 .await
                 .map_err(FailedExecution),
             Task::AddMessageReaction(channel, message, reaction) => client
                 .create_reaction(channel.0, message.0, reaction)
+                .compat()
                 .await
                 .map_err(FailedExecution),
+            Task::SendDM(channel, message) => client
+                .send_message(channel.0, &SerdeValue::String(message.clone()))
+                .compat()
+                .await
+                .map(|_| ())
+                .map_err(FailedExecution),
         };
-        info!("Run {:?}, with client(token): {:?}, {:?}", self.task.t, client.token, result);
+        info!(
+            "Run {:?}, with client(token): {:?}, {:?}",
+            self.task.t, client.token, result
+        );
         if let Err(err) = self.sender.try_send(result) {
             debug!("Task Error Result was dropped: {:?}", err.into_inner());
         }
@@ -115,19 +135,25 @@ impl TaskHandle {
     fn drop(self) {
         info!("Dropping Task: {:?}", self.task.t);
         if let Err(err) = self.sender.try_send(Err(TaskError::Dropped())) {
-            debug!("Task Error was dropped: {:?}", err.into_inner().unwrap_err())
+            debug!(
+                "Task Error was dropped: {:?}",
+                err.into_inner().unwrap_err()
+            )
         }
     }
 
     fn drop_no_bot(self) {
         info!("Dropping {:?}, Reason: No Bot Exists", self.task.t);
         if let Err(err) = self.sender.try_send(Err(TaskError::BotDoesNotExist())) {
-            debug!("Task Error was dropped: {:?}", err.into_inner().unwrap_err())
+            debug!(
+                "Task Error was dropped: {:?}",
+                err.into_inner().unwrap_err()
+            )
         }
     }
 
     /// Await Task completion
-    pub async fn complete(&self) -> Result<(), TaskError>{
+    pub async fn complete(&self) -> Result<(), TaskError> {
         self.receiver.recv().await.expect("Unexpectedly Dropped")
     }
 
@@ -137,6 +163,7 @@ impl TaskHandle {
             Task::DeleteMessageReaction(_, _, _, _) => channel_id_message_id_reaction,
             Task::DeleteMessage(_, _) => channel_id_message,
             Task::AddMessageReaction(_, _, _) => channel_id_message_id_reaction_self,
+            Task::SendDM(_, _) => channel_id_message,
         } as usize;
 
         ROUTES
@@ -150,36 +177,29 @@ impl TaskHandle {
 pub struct TaskScheduler {
     task_sender: Sender<TaskHandle>,
     guild_id: Final<GuildId>,
-    channel_id: Arc<ArcSwap<ChannelId>>,
+    channel_id: ChannelId,
 }
 
 impl TaskScheduler {
     ///Builds a new Scheduler for a Guild based on the used Https
-    pub fn new<'a>(
+    pub fn new(
         guild_id: GuildId,
         channel_id: ChannelId,
-        worker: Vec<&'a Http>,
-    ) -> (Self, Pin<Box<dyn Future<Output = ()> + 'a>>) {
+        worker: Vec<Arc<Http>>,
+    ) -> (Self, Pin<Box<dyn Future<Output = SchedulerError> + Send>>) {
         let (task_sender, task_receiver) = channel::bounded(QUEUE_LIMIT);
-
-        let channel_id = Arc::new(ArcSwap::from(Arc::new(channel_id)));
 
         let scheduler = TaskScheduler {
             task_sender,
             guild_id: Final::new(guild_id),
-            channel_id: channel_id.clone(),
+            channel_id,
         };
 
         (
             // The Scheduler used for enqueuing new Tasks
             scheduler,
             // Future which will run the Scheduler
-            Box::pin(run_async(
-                worker,
-                guild_id,
-                channel_id,
-                task_receiver,
-            )),
+            run_async(worker, guild_id, channel_id, task_receiver).boxed(),
         )
     }
 
@@ -188,40 +208,62 @@ impl TaskScheduler {
         self.task_sender.clone()
     }
 
-    /// Changes the channel_id in case the Bot Channel Changed
-    pub fn change_channel_id(&self, channel_id: ChannelId) {
-        debug!("Changing Channel ID for {:?}, to {:?}", self.guild_id.t, channel_id);
-        self.channel_id.swap(Arc::new(channel_id));
-    }
+    // Changes the channel_id in case the Bot Channel Changed
+    //pub fn change_channel_id(&self, channel_id: ChannelId) {
+    //    debug!(
+    //        "Changing Channel ID for {:?}, to {:?}",
+    //        self.guild_id.t, channel_id
+    //    );
+    //    self.channel_id.swap(Arc::new(channel_id));
+    //}
 
-    ///Does not Block if the Buffer is full
-    pub fn try_send_task(&self, task: TaskHandle) -> Result<(), ()> {
-        info!("Try Sending {:?}, to {:?}", task.task.t, self.guild_id.t);
-        if let Err(err) = self.task_sender.try_send(task) {
-            match err {
-                TrySendError::Full(task) => {
-                    warn!("Buffer Full. {:?}", self.guild_id.t);
-                    task.drop();
-                    return Err(());
-                }
-                TrySendError::Closed(_) => {
-                    let msg = format!("Task Receiver dropped. {:?}", self.guild_id.t);
-                    error!("{}", &msg);
-                    panic!(msg)
-                }
-            }
-        }
-        Ok(())
-    }
+    /////Does not Block if the Buffer is full
+    //pub fn try_send_task(&self, task: TaskHandle) -> Result<(), SendError> {
+    //    info!("Try Sending {:?}, to {:?}", task.task.t, self.guild_id.t);
+    //    if let Err(err) = self.task_sender.try_send(task) {
+    //        match err {
+    //            TrySendError::Full(task) => {
+    //                warn!("Buffer Full. {:?}", self.guild_id.t);
+    //                task.drop();
+    //                return Err(SendError::BufferFull());
+    //            }
+    //            TrySendError::Closed(_) => {
+    //                error!("Task Receiver dropped. {:?}", self.guild_id.t);
+    //                return Err(SendError::StreamDropped(self.guild_id.t));
+    //            }
+    //        }
+    //    }
+    //    Ok(())
+    //}
+    //
+    /////Blocks if the Buffer is full
+    //pub async fn send_task(&self, task: TaskHandle) -> Result<(), SendError> {
+    //    if self.task_sender.send(task).await.is_err() {
+    //        error!("Task Receiver dropped. {:?}", self.guild_id.t);
+    //        return Err(SendError::StreamDropped(self.guild_id.t));
+    //    };
+    //    Ok(())
+    //}
+}
 
-    ///Blocks if the Buffer is full
-    pub async fn send_task(&self, task: TaskHandle) {
-        if self.task_sender.send(task).await.is_err() {
-            let msg = format!("Task Receiver dropped. {:?}", self.guild_id.t);
-            error!("{}", &msg);
-            panic!(msg)
-        };
-    }
+//#[derive(Debug, Error)]
+//pub enum SendError {
+//    #[error("The Buffer is full")]
+//    BufferFull(),
+//    #[error("Task Receiver dropped. GuildID: {0:?}")]
+//    StreamDropped(GuildId),
+//}
+
+#[derive(Error, Debug)]
+pub enum SchedulerError {
+    #[error("Guild: {0:?}, Error: {1:?}")]
+    ReceiveError(GuildId, RecvError),
+    #[error("Guild: {0:?}, RouteID: {1}")]
+    SendError(GuildId, usize),
+    #[error("Couldn't get Rate Limit for {0:?}. Guild: {1:?}, Channel: {2:?}")]
+    RateLimitError(Route, GuildId, ChannelId),
+    #[error("Couldn't get Reset Time for {0:?}. Guild: {1:?}, Channel: {2:?}")]
+    ResetTimeError(Route, GuildId, ChannelId),
 }
 
 /// Receive Task and send it to the proper scheduler
@@ -229,13 +271,13 @@ async fn split_receive(
     receiver: Receiver<TaskHandle>,
     sender: [Sender<TaskHandle>; ROUTES.len()],
     guild_id: GuildId,
-) {
+) -> SchedulerError {
     loop {
         let task = match receiver.recv().await {
             Err(err) => {
-                let msg = format!("{:?}, {:?}", err, guild_id);
-                error!("{}", &msg);
-                panic!(msg);
+                let msg = SchedulerError::ReceiveError(guild_id, err);
+                error!("{:?}", &msg);
+                return msg;
             }
             Ok(task) => task,
         };
@@ -244,19 +286,13 @@ async fn split_receive(
         if let Err(err) = sender[route_id].try_send(task) {
             match err {
                 TrySendError::Full(task) => {
-                    warn!(
-                        "Buffer Full. {:?}, RouteID: {:?}",
-                        guild_id, route_id
-                    );
+                    warn!("Buffer Full. {:?}, RouteID: {:?}", guild_id, route_id);
                     task.drop();
                 }
                 TrySendError::Closed(_) => {
-                    let msg = format!(
-                        "Task Receiver dropped. {:?}, RouteID: {:?}",
-                        guild_id, route_id
-                    );
-                    error!("{}", &msg);
-                    panic!(msg);
+                    let msg = SchedulerError::SendError(guild_id, route_id);
+                    error!("{:?}", &msg);
+                    return msg;
                 }
             }
         }
@@ -264,12 +300,12 @@ async fn split_receive(
 }
 
 async fn run_async(
-    worker: Vec<&Http>,
+    worker: Vec<Arc<Http>>,
     guild_id: GuildId,
-    channel_id: Arc<ArcSwap<ChannelId>>,
+    channel_id: ChannelId,
     task_receiver: Receiver<TaskHandle>,
-) {
-    let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
+) -> SchedulerError {
+    let mut pool: Vec<Pin<Box<dyn Future<Output = SchedulerError> + Send>>> = Vec::new();
     let mut route_senders: ArrayVec<[Sender<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
     let mut route_receivers: ArrayVec<[Receiver<TaskHandle>; ROUTES.len()]> = ArrayVec::new();
 
@@ -281,27 +317,24 @@ async fn run_async(
 
     //This one is for taking any received tasks and pushing it to the appropriate receiver
     let route_senders = route_senders.into_inner().unwrap();
-    pool.push(Box::pin(split_receive(
-        task_receiver,
-        route_senders,
-        guild_id,
-    )));
+    pool.push(split_receive(task_receiver, route_senders, guild_id).boxed());
 
     //Here we start the receivers. They will schedule any received task to a free Http object
     for route in ROUTES.iter() {
-        pool.push(Box::pin(task_type_scheduler(
-            route_receivers.pop_at(0).expect("Not enough Receivers"),
-            *route,
-            guild_id,
-            &channel_id,
-            worker.clone(),
-        )))
+        pool.push(
+            task_type_scheduler(
+                route_receivers.pop_at(0).expect("Not enough Receivers"),
+                *route,
+                guild_id,
+                channel_id,
+                worker.clone(),
+            )
+            .boxed(),
+        )
     }
 
     //Here we make them all run
-    futures::future::select_all(pool).await;
-    //If any one of those exited, we exit the program
-    panic!("Scheduler exited")
+    futures::future::select_all(pool).await.0
 }
 
 //Hosts all Https for this Task
@@ -309,10 +342,10 @@ async fn task_type_scheduler(
     shared_receiver: Receiver<TaskHandle>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
-    channel_id: &ArcSwap<ChannelId>,
-    worker: Vec<&Http>,
-) {
-    let mut pool: Vec<Pin<Box<dyn Future<Output = ()>>>> = Vec::new();
+    channel_id: ChannelId,
+    worker: Vec<Arc<Http>>,
+) -> SchedulerError {
+    let mut pool: Vec<Pin<Box<dyn Future<Output = SchedulerError> + Send>>> = Vec::new();
 
     for w in worker.iter() {
         pool.push(Box::pin(task_http_loop(
@@ -320,12 +353,11 @@ async fn task_type_scheduler(
             route,
             guild_id,
             channel_id,
-            w,
+            w.clone(),
         )));
     }
 
-    futures::future::select_all(pool).await;
-    panic!("Http Loop Exited")
+    futures::future::select_all(pool).await.0
 }
 
 //Makes sure Http is ready for Task, then tries to get one, for executing it
@@ -333,23 +365,19 @@ async fn task_http_loop(
     shared_receiver: Receiver<TaskHandle>,
     route: fn(ChannelId, GuildId) -> Route,
     guild_id: GuildId,
-    channel_id: &ArcSwap<ChannelId>,
-    worker: &Http,
-) {
+    channel_id: ChannelId,
+    worker: Arc<Http>,
+) -> SchedulerError {
     loop {
         let ready = {
             let routes_map = worker.ratelimiter.routes();
             let routes_map = routes_map.read().await;
-            let channel_id = **channel_id.load();
             let target_route = route(channel_id, guild_id);
             let rate_limit = match routes_map.get(&target_route) {
                 None => {
-                    let msg = format!(
-                        "Couldn't get Rate Limit for {:?}. {:?}, {:?}",
-                        target_route, guild_id, channel_id
-                    );
-                    error!("{}", &msg);
-                    panic!(msg);
+                    let msg = SchedulerError::RateLimitError(target_route, guild_id, channel_id);
+                    error!("{:?}", &msg);
+                    return msg;
                 }
                 Some(rl) => rl,
             };
@@ -359,12 +387,10 @@ async fn task_http_loop(
             } else {
                 Err(match rate_limit.reset_after() {
                     None => {
-                        let msg = format!(
-                            "Couldn't get Reset Time for Route: {:?}. Guild: {:?}, Channel: {:?}",
-                            target_route, guild_id, channel_id
-                        );
-                        error!("{}", &msg);
-                        panic!(msg);
+                        let msg =
+                            SchedulerError::ResetTimeError(target_route, guild_id, channel_id);
+                        error!("{:?}", &msg);
+                        return msg;
                     }
                     Some(reset) => reset,
                 })
@@ -377,7 +403,7 @@ async fn task_http_loop(
                     .recv()
                     .await
                     .expect("Task splitter was dropped")
-                    .run(worker)
+                    .run(worker.clone())
                     .await;
             }
             Err(duration) => {
