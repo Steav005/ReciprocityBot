@@ -1,7 +1,5 @@
 use serenity::async_trait;
 
-use heapless::consts::U50;
-use heapless::HistoryBuffer;
 use log::{debug, error, info, warn};
 use serenity::client::EventHandler as SerenityEventHandler;
 use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ResumedEvent, VoiceState};
@@ -15,10 +13,12 @@ use std::path::Iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use arraydeque::ArrayDeque;
 
-pub static EVENT_STREAM_LIMIT: usize = 200;
+pub const EVENT_STREAM_LIMIT: usize = 200;
+pub const CACHE_SIZE: usize = 100;
 
-type Cache = Arc<Mutex<HistoryBuffer<Event, U50>>>;
+type Cache = Arc<Mutex<ArrayDeque<[Event; CACHE_SIZE]>>>;
 
 #[derive(Clone)]
 pub struct EventHandler {
@@ -45,7 +45,6 @@ pub enum Event {
     DeleteMessage(ChannelId, MessageId),
     Resume(Instant, ResumedEvent),
     VoiceUpdate(VoiceState),
-    None,
 }
 
 impl Event {
@@ -55,12 +54,6 @@ impl Event {
 
     pub fn is_resume(&self) -> bool {
         matches!(self, Event::Resume(_, _))
-    }
-}
-
-impl Default for Event {
-    fn default() -> Self {
-        Event::None
     }
 }
 
@@ -77,14 +70,12 @@ impl PartialEq for Event {
 }
 
 impl EventHandler {
-    pub fn new(
-        guilds: Vec<GuildId>,
-    ) -> (EventHandler, Vec<(GuildId, Receiver<Event>)>) {
+    pub fn new(guilds: Vec<GuildId>) -> (EventHandler, Vec<(GuildId, Receiver<Event>)>) {
         let mut map = HashMap::new();
         let mut receiver = Vec::new();
 
         for guild in guilds {
-            let cache = Arc::new(Mutex::new(HistoryBuffer::<Event, U50>::new()));
+            let cache = Arc::new(Mutex::new(ArrayDeque::new()));
             let (send, rec) = channel::bounded(EVENT_STREAM_LIMIT);
 
             map.borrow_mut().insert(guild, (cache, send));
@@ -112,10 +103,13 @@ impl EventHandler {
                 } else {
                     {
                         let mut cache = cache.lock().await;
-                        if cache.as_slice().iter().any(|i| i == &event) {
+                        if cache.iter().any(|i| i == &event) {
                             return Ok(());
                         }
-                        cache.write(event.clone());
+                        if cache.is_full(){
+                            cache.pop_back().expect("Cache is empty");
+                        }
+                        cache.push_front(event.clone()).expect("Cache is full");
                     }
                     sender
                         .send(event)

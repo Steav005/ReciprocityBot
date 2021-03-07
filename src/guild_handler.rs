@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::Config;
+use crate::event_handler::Event;
 use crate::message_manager::{MessageManager, MessageManagerError};
 use crate::scheduler::{SchedulerError, TaskScheduler};
 use crate::voice_handler::{VoiceHandler, VoiceHandlerError};
@@ -57,9 +58,11 @@ impl ReciprocityGuild {
         channel: ChannelId,
         bots: Vec<(UserId, Arc<Http>)>,
         voice_handler: VoiceHandler,
+        event_receiver: Receiver<Event>,
         config: Config,
     ) -> Result<(Self, ReciprocityGuildRunner), GuildHandlerError> {
         let mut run_all: Vec<Pin<Box<dyn Future<Output = GuildHandlerError> + Send>>> = Vec::new();
+
         let (scheduler, run) = TaskScheduler::new(
             guild,
             channel,
@@ -76,9 +79,6 @@ impl ReciprocityGuild {
             config,
         };
 
-        Ok((
-            guild,
-            select_all(run_all).map(|(res, _, _)| res).boxed(),
-        ))
+        Ok((guild, select_all(run_all).map(|(res, _, _)| res).boxed()))
     }
 }

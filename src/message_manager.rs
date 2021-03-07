@@ -4,103 +4,74 @@ use crate::scheduler::TaskHandle;
 use crate::voice_handler::VoiceTask;
 use async_compat::CompatExt;
 use futures::{Future, FutureExt, Stream};
+use serde_json::Value;
 use serenity::http::Http;
-use serenity::model::channel::Embed;
+use serenity::model::channel::{Embed, Message};
 use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::prelude::SerenityError;
+use serenity::utils::MessageBuilder;
 use smol::channel::{Receiver, Sender};
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-enum MessageContent {
-    Embed(Vec<Embed>),
-    Plain(String),
+#[derive(Error, Debug)]
+enum MessageError {
+    #[error("Message Content is Identical: {0:?}")]
+    MessageContentIsIdentical(String),
+    #[error("Serenity Error Occurred: {0:?}")]
+    SerenityError(SerenityError),
 }
 
-struct Message {
+struct ReciprocityMessage {
     id: MessageId,
     sender: (UserId, Arc<Http>),
     channel: ChannelId,
-    content: MessageContent,
-    timeout: Option<Duration>,
-    hash: u64,
+    content: String,
 }
 
-impl Hash for Message {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let embeds = match &self.content {
-            MessageContent::Embed(e) => e,
-            MessageContent::Plain(msg) => {
-                msg.hash(state);
-                return;
-            }
-        };
-
-        for e in embeds.iter() {
-            //Skip Author
-            e.colour.0.hash(state);
-            if let Some(desc) = &e.description {
-                desc.hash(state);
-            }
-            for f in e.fields.iter() {
-                f.value.hash(state);
-                f.name.hash(state);
-                f.inline.hash(state);
-            }
-            if let Some(foot) = &e.footer {
-                if let Some(icon) = &foot.icon_url {
-                    icon.hash(state);
-                }
-                if let Some(proxy) = &foot.proxy_icon_url {
-                    proxy.hash(state);
-                }
-                foot.text.hash(state);
-            }
-            if let Some(img) = &e.image {
-                img.height.hash(state);
-                img.width.hash(state);
-                img.proxy_url.hash(state);
-                img.url.hash(state);
-            }
-            //Skip Kind
-            //Skip Provider
-            if let Some(thumb) = &e.thumbnail {
-                thumb.height.hash(state);
-                thumb.width.hash(state);
-                thumb.proxy_url.hash(state);
-                thumb.url.hash(state);
-            }
-            //Skip Timestamp
-            if let Some(title) = &e.title {
-                title.hash(state);
-            }
-            if let Some(url) = &e.url {
-                url.hash(state);
-            }
-            //Skip Video
+impl ReciprocityMessage {
+    async fn update(&mut self, mut content: String) -> Result<(), MessageError> {
+        if self.content.eq(&content) {
+            return Err(MessageError::MessageContentIsIdentical(content));
         }
+        std::mem::swap(&mut self.content, &mut content);
+        let old_content = content;
+
+        let result = self
+            .sender
+            .1
+            .edit_message(
+                self.channel.0,
+                self.id.0,
+                &Value::String(self.content.clone()),
+            )
+            .compat()
+            .await;
+        if let Err(e) = result {
+            self.content = old_content;
+            return Err(MessageError::SerenityError(e));
+        }
+        Ok(())
     }
 }
 
-impl Message {
-    async fn update(&mut self) -> Result<(), ()> {
-        unimplemented!();
-    }
+struct SearchMessage {
+    message: ReciprocityMessage,
 }
 
-impl PartialEq for Message {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
-    }
+struct MainBotMessage {
+    message: ReciprocityMessage,
 }
 
 pub struct MessageManager {
     //event_stream: Receiver<Event>,
     task_handler: Sender<TaskHandle>,
-    //voice_handler: Sender<VoiceTask>,
-    player: Vec<Message>,
+    voice_handler: Sender<VoiceTask>,
+
     bots: Vec<(UserId, Arc<Http>)>,
 }
 
@@ -109,17 +80,19 @@ impl MessageManager {
         bots: Vec<(UserId, Arc<Http>)>,
         //event_stream: Receiver<Event>,
         task_handler: Sender<TaskHandle>,
-        //voice_handler: Sender<VoiceTask>,
-    ) -> (Self, Pin<Box<dyn Future<Output = MessageManagerError>>>) {
+        voice_handler: Sender<VoiceTask>,
+    ) -> (
+        Self,
+        Pin<Box<dyn Future<Output = MessageManagerError> + Send>>,
+    ) {
         (
             MessageManager {
                 //event_stream,
                 task_handler,
-                //voice_handler,
-                player: Vec::new(),
+                voice_handler,
                 bots,
             },
-            run_async().boxed_local(),
+            run_async().boxed(),
         )
     }
 }

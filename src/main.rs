@@ -3,8 +3,9 @@ use crate::event_handler::{Event, EventHandler};
 use crate::guild_handler::{GuildHandlerError, ReciprocityGuild};
 use crate::scheduler::TaskScheduler;
 use crate::voice_handler::{VoiceHandler, VoiceHandlerError};
-use async_compat::{CompatExt, Compat};
+use async_compat::{Compat, CompatExt};
 use easy_parallel::Parallel;
+use futures::future::Either;
 use futures::FutureExt;
 use lavalink_rs::model::UserId as LavalinkUser;
 use serenity::client::Extras;
@@ -20,7 +21,6 @@ use songbird::{SerenityInit, SongbirdKey};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use thiserror::Error;
-use futures::future::Either;
 
 mod config;
 mod event_handler;
@@ -43,11 +43,14 @@ fn main() -> Result<(), ReciprocityError> {
         let (send_stop_request, receive_stop_request) = smol::channel::bounded::<()>(1);
         let (send_error_occurred, receive_error_occurred) = smol::channel::bounded::<()>(1);
 
-        let e_guilds = config.guilds.values().map(|guild| GuildId(guild.guild_id)).collect();
+        let e_guilds = config
+            .guilds
+            .values()
+            .map(|guild| GuildId(guild.guild_id))
+            .collect();
         let e_guilds = e_guilds;
         //Build EventHandler
-        let (event_handler, mut event_receiver) =
-            EventHandler::new(e_guilds);
+        let (event_handler, mut event_receiver) = EventHandler::new(e_guilds);
 
         //Get Bots: Vector aus (UserID, Client)
         let mut bot_clients = build_bots(config.bots.values(), event_handler).await?;
@@ -75,25 +78,37 @@ fn main() -> Result<(), ReciprocityError> {
                     })?,
             ));
         }
-        let (voice_handler, voice_handler_run) = VoiceHandler::new(voice_handler_bots, config.clone());
+        let (voice_handler, voice_handler_run) =
+            VoiceHandler::new(voice_handler_bots, config.clone());
         let voice_receive_stop = receive_stop_request.clone();
         let voice_send_error = send_error_occurred.clone();
 
         //Build list for guild threads
-        let mut guilds: Vec<(GuildId, ChannelId, Receiver<Event>)> = event_receiver.drain(..).map(|(id, rec)| {
-            config
-                .guilds
-                .iter()
-                .find(|(_, cfg)| cfg.guild_id == id.0)
-                .map(|(_, config)| (GuildId(config.guild_id), ChannelId(config.channel_id), rec))
-        }).filter(|g| g.is_some()).map(|guild| guild.unwrap()).collect();
+        let mut guilds: Vec<(GuildId, ChannelId, Receiver<Event>)> = event_receiver
+            .drain(..)
+            .map(|(id, rec)| {
+                config
+                    .guilds
+                    .iter()
+                    .find(|(_, cfg)| cfg.guild_id == id.0)
+                    .map(|(_, config)| {
+                        (GuildId(config.guild_id), ChannelId(config.channel_id), rec)
+                    })
+            })
+            .filter(|g| g.is_some())
+            .map(|guild| guild.unwrap())
+            .collect();
 
         let mut result = Parallel::new()
             .add(|| {
                 smol::future::block_on(ex.run(async move {
-                    let result = futures::future::select(voice_handler_run.boxed(), voice_receive_stop.recv().boxed()).await;
-                    if let Either::Left((error, _)) = result{
-                        if let Ok(()) = voice_send_error.send(()).await{
+                    let result = futures::future::select(
+                        voice_handler_run.boxed(),
+                        voice_receive_stop.recv().boxed(),
+                    )
+                    .await;
+                    if let Either::Left((error, _)) = result {
+                        if let Ok(()) = voice_send_error.send(()).await {
                             //Ignore
                         }
                         Err(ReciprocityError::VoiceHandlerError(error))
@@ -102,37 +117,50 @@ fn main() -> Result<(), ReciprocityError> {
                     }
                 }))
             })
-            .each(bot_clients.drain(..).zip((0..bots.len()).map(|_| (send_error_occurred.clone(), receive_stop_request.clone()))), |((id, mut client), (send_error, stop))| {
-                smol::future::block_on(ex.run(async move {
-                    let result = futures::future::select(
-                    client
-                        .start_autosharded()
-                        .compat().boxed(), stop.recv().boxed()).await;
-                    if let Either::Left((error, _)) = result{
-                        if let Ok(()) = send_error.send(()).await{
-                            //Ignore
+            .each(
+                bot_clients.drain(..).zip(
+                    (0..bots.len())
+                        .map(|_| (send_error_occurred.clone(), receive_stop_request.clone())),
+                ),
+                |((id, mut client), (send_error, stop))| {
+                    smol::future::block_on(ex.run(async move {
+                        let result = futures::future::select(
+                            client.start_autosharded().compat().boxed(),
+                            stop.recv().boxed(),
+                        )
+                        .await;
+                        if let Either::Left((error, _)) = result {
+                            if let Ok(()) = send_error.send(()).await {
+                                //Ignore
+                            }
+                            Err(match error {
+                                Ok(_) => ReciprocityError::ClientStoppedUnexpectedly(),
+                                Err(e) => ReciprocityError::SerenityError(e),
+                            })
+                        } else {
+                            Ok(())
                         }
-                        Err(match error{
-                            Ok(_) => ReciprocityError::ClientStoppedUnexpectedly(),
-                            Err(e) => ReciprocityError::SerenityError(e)
-                        })
-                    }else {
-                        Ok(())
-                    }
-                }))
-            })
+                    }))
+                },
+            )
             //.each(guilds.drain(..), |(guild, channel, rec)| {
             //    smol::future::block_on(ex.run(async move {
             //        ReciprocityGuild::new(guild, channel, bots.clone(), voice_handler.clone(), config)
             //    }))
             //})
-            .finish(|| smol::future::block_on(async {
-                if let Err(e) = receive_error_occurred.recv().await{
-                    panic!(e);
-                }
-                drop(send_stop_request)
-            }));
-        let result = result.0.drain(..).find(|r| r.is_err()).expect("Exit without error");
+            .finish(|| {
+                smol::future::block_on(async {
+                    if let Err(e) = receive_error_occurred.recv().await {
+                        panic!(e);
+                    }
+                    drop(send_stop_request)
+                })
+            });
+        let result = result
+            .0
+            .drain(..)
+            .find(|r| r.is_err())
+            .expect("Exit without error");
         result
     }))
 }

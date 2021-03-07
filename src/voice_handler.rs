@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::{Config, LavalinkConfig};
-use crate::player::{Player, PlayerError};
+use crate::player::{Player, PlayerError, PlayerStatus};
 use arc_swap::ArcSwap;
 use async_compat::CompatExt;
 use futures::prelude::future::Either;
@@ -20,6 +20,7 @@ use serenity::model::prelude::GuildId;
 use smol::channel::{Receiver, RecvError, Sender};
 use smol::{channel, Timer};
 use songbird::Songbird;
+use event_listener::Event as Notify;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -84,23 +85,42 @@ impl VoiceTask {
     }
 }
 
+type PlayerStatusSwap = Arc<ArcSwap<Option<PlayerStatus>>>;
+
 ///Does the VoiceHandling for the entire Bot Network <br>
 ///Manages Lavalink related stuff
 #[derive(Clone)]
 pub struct VoiceHandler {
     task_sender: Sender<VoiceTask>,
+    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
 }
 
 impl VoiceHandler {
     pub fn new(
         bots: Vec<(UserId, Arc<Http>, Arc<Songbird>)>,
         config: Config,
-    ) -> (Self, Pin<Box<dyn Future<Output = VoiceHandlerError> + Send>>) {
+    ) -> (
+        Self,
+        Pin<Box<dyn Future<Output = VoiceHandlerError> + Send>>,
+    ) {
         let (task_sender, task_receiver) = channel::bounded(TASK_QUEUE_LIMIT);
 
+        let mut player_states = HashMap::new();
+        for guild in config.guilds.values() {
+            let mut guild_player_map: HashMap<_, PlayerStatusSwap> = HashMap::new();
+            for (bot_id, _, _) in bots.iter() {
+                guild_player_map.insert(*bot_id, Arc::new(ArcSwap::new(Arc::new(None))));
+            }
+            player_states.insert(GuildId(guild.guild_id), guild_player_map);
+        }
+        let player_states = Arc::new(player_states);
+
         (
-            VoiceHandler { task_sender },
-            run_async(task_receiver, bots, config).boxed(),
+            VoiceHandler {
+                task_sender,
+                player_states: player_states.clone(),
+            },
+            run_async(task_receiver, bots, player_states, config).boxed(),
         )
     }
 
@@ -125,6 +145,7 @@ pub enum VoiceHandlerError {
 async fn run_async(
     voice_task_receiver: Receiver<VoiceTask>,
     bots: Vec<(UserId, Arc<Http>, Arc<Songbird>)>,
+    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
     config: Config,
 ) -> VoiceHandlerError {
     //future pool for collection all the futures
@@ -164,6 +185,7 @@ async fn run_async(
                 songbird.clone(),
                 config.lavalink.clone(),
                 bot_guild_map_bot,
+                player_states.clone(),
                 http,
             )
             .boxed(),
@@ -247,6 +269,7 @@ async fn bot_run_async(
     songbird: Arc<Songbird>,
     config: LavalinkConfig,
     guild_map: HashMap<GuildId, (Arc<ArcSwap<bool>>, Receiver<VoiceTask>)>,
+    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
     http: Arc<Http>,
 ) -> VoiceHandlerError {
     //Send map for the EventHandler, contains Sender for each Guild
@@ -278,13 +301,19 @@ async fn bot_run_async(
     //lavalink client pre-initialized
     let mut lavalink = build_lavalink_client(id, &config, event_handler.clone()).await;
     //Initially fill pool with values from backup_map
-    for (_, (free, task_rec, event_rec)) in backup_map.iter() {
+    for (guild, (free, task_rec, event_rec)) in backup_map.iter() {
         pool.push(
             bot_guild_run_async(
                 id,
                 lavalink.clone(),
                 songbird.clone(),
                 free.clone(),
+                player_states
+                    .get(guild)
+                    .expect("Guild missing in player_states")
+                    .get(&id)
+                    .expect("Bot missing in player_states")
+                    .clone(),
                 task_rec.clone(),
                 event_rec.clone(),
             )
@@ -320,6 +349,12 @@ async fn bot_run_async(
                 lavalink.clone(),
                 songbird.clone(),
                 free,
+                player_states
+                    .get(&guild)
+                    .expect("Guild missing in player_states")
+                    .get(&id)
+                    .expect("Bot missing in player_states")
+                    .clone(),
                 task_receiver,
                 event_receiver,
             )
@@ -334,6 +369,7 @@ async fn bot_guild_run_async(
     lavalink: LavalinkClient,
     songbird: Arc<Songbird>,
     free: Arc<ArcSwap<bool>>,
+    player_state: PlayerStatusSwap,
     task_receiver: Receiver<VoiceTask>,
     event_receiver: Receiver<LavalinkEvent>,
 ) -> Either<(GuildId, PlayerError, LavalinkClient), VoiceHandlerError> {
@@ -346,6 +382,8 @@ async fn bot_guild_run_async(
 
     //Main loop of bot_guild_run_async
     loop {
+        //TODO user player_state
+
         //Wait for any of the two receiver to receive anything
         match futures::future::select(task_rec, event_rec).await {
             //If a Task was received

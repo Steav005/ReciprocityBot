@@ -38,6 +38,8 @@ pub enum Playback {
     AllLoop,
 }
 
+pub struct PlayerStatus {}
+
 pub struct Player {
     bot_id: UserId,
     guild_id: GuildId,
