@@ -1,9 +1,10 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::too_many_arguments)]
 
 use crate::config::{Config, LavalinkConfig};
-use crate::player::{Player, PlayerError, PlayerStatus};
+use crate::player::{Player, PlayerError, PlayerStatus, Playback};
 use arc_swap::ArcSwap;
 use async_compat::CompatExt;
+use event_listener::Event as SmolEvent;
 use futures::prelude::future::Either;
 use futures::prelude::*;
 use lavalink_rs::gateway::LavalinkEventHandler as EventHandler;
@@ -20,7 +21,6 @@ use serenity::model::prelude::GuildId;
 use smol::channel::{Receiver, RecvError, Sender};
 use smol::{channel, Timer};
 use songbird::Songbird;
-use event_listener::Event as Notify;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -85,14 +85,16 @@ impl VoiceTask {
     }
 }
 
-type PlayerStatusSwap = Arc<ArcSwap<Option<PlayerStatus>>>;
+pub type PlayerStatusMap = Arc<HashMap<GuildId, HashMap<UserId, (Notify, PlayerStatusSwap)>>>;
+pub type PlayerStatusSwap = Arc<ArcSwap<Option<PlayerStatus>>>;
+pub type Notify = Arc<SmolEvent>;
 
 ///Does the VoiceHandling for the entire Bot Network <br>
 ///Manages Lavalink related stuff
 #[derive(Clone)]
 pub struct VoiceHandler {
     task_sender: Sender<VoiceTask>,
-    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
+    player_states: PlayerStatusMap,
 }
 
 impl VoiceHandler {
@@ -107,9 +109,15 @@ impl VoiceHandler {
 
         let mut player_states = HashMap::new();
         for guild in config.guilds.values() {
-            let mut guild_player_map: HashMap<_, PlayerStatusSwap> = HashMap::new();
+            let mut guild_player_map: HashMap<_, (Notify, PlayerStatusSwap)> = HashMap::new();
             for (bot_id, _, _) in bots.iter() {
-                guild_player_map.insert(*bot_id, Arc::new(ArcSwap::new(Arc::new(None))));
+                guild_player_map.insert(
+                    *bot_id,
+                    (
+                        Arc::new(SmolEvent::new()),
+                        Arc::new(ArcSwap::new(Arc::new(None))),
+                    ),
+                );
             }
             player_states.insert(GuildId(guild.guild_id), guild_player_map);
         }
@@ -145,7 +153,7 @@ pub enum VoiceHandlerError {
 async fn run_async(
     voice_task_receiver: Receiver<VoiceTask>,
     bots: Vec<(UserId, Arc<Http>, Arc<Songbird>)>,
-    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
+    player_states: PlayerStatusMap,
     config: Config,
 ) -> VoiceHandlerError {
     //future pool for collection all the futures
@@ -269,7 +277,7 @@ async fn bot_run_async(
     songbird: Arc<Songbird>,
     config: LavalinkConfig,
     guild_map: HashMap<GuildId, (Arc<ArcSwap<bool>>, Receiver<VoiceTask>)>,
-    player_states: Arc<HashMap<GuildId, HashMap<UserId, PlayerStatusSwap>>>,
+    player_states: PlayerStatusMap,
     http: Arc<Http>,
 ) -> VoiceHandlerError {
     //Send map for the EventHandler, contains Sender for each Guild
@@ -302,18 +310,21 @@ async fn bot_run_async(
     let mut lavalink = build_lavalink_client(id, &config, event_handler.clone()).await;
     //Initially fill pool with values from backup_map
     for (guild, (free, task_rec, event_rec)) in backup_map.iter() {
+        let (player_change, player_state) = player_states
+            .get(guild)
+            .expect("Guild missing in player_states")
+            .get(&id)
+            .expect("Bot missing in player_states")
+            .clone();
+
         pool.push(
             bot_guild_run_async(
                 id,
                 lavalink.clone(),
                 songbird.clone(),
                 free.clone(),
-                player_states
-                    .get(guild)
-                    .expect("Guild missing in player_states")
-                    .get(&id)
-                    .expect("Bot missing in player_states")
-                    .clone(),
+                player_change,
+                player_state,
                 task_rec.clone(),
                 event_rec.clone(),
             )
@@ -343,18 +354,20 @@ async fn bot_run_async(
 
         //Move pool and push bot run again with backup data
         pool = rem;
+        let (player_change, player_state) = player_states
+            .get(&guild)
+            .expect("Guild missing in player_states")
+            .get(&id)
+            .expect("Bot missing in player_states")
+            .clone();
         pool.push(
             bot_guild_run_async(
                 id,
                 lavalink.clone(),
                 songbird.clone(),
                 free,
-                player_states
-                    .get(&guild)
-                    .expect("Guild missing in player_states")
-                    .get(&id)
-                    .expect("Bot missing in player_states")
-                    .clone(),
+                player_change,
+                player_state,
                 task_receiver,
                 event_receiver,
             )
@@ -369,6 +382,7 @@ async fn bot_guild_run_async(
     lavalink: LavalinkClient,
     songbird: Arc<Songbird>,
     free: Arc<ArcSwap<bool>>,
+    player_change: Notify,
     player_state: PlayerStatusSwap,
     task_receiver: Receiver<VoiceTask>,
     event_receiver: Receiver<LavalinkEvent>,
@@ -382,8 +396,6 @@ async fn bot_guild_run_async(
 
     //Main loop of bot_guild_run_async
     loop {
-        //TODO user player_state
-
         //Wait for any of the two receiver to receive anything
         match futures::future::select(task_rec, event_rec).await {
             //If a Task was received
@@ -409,6 +421,8 @@ async fn bot_guild_run_async(
                                         channel,
                                         lavalink.clone(),
                                         &songbird,
+                                        player_change.clone(),
+                                        player_state.clone(),
                                     )
                                     .await
                                     {
@@ -438,25 +452,43 @@ async fn bot_guild_run_async(
                                 free.store(Arc::new(true));
                             }
                             VoiceTask::Next(_, _) => {
-                                todo!()
+                                if let Some(player) = &player {
+                                    player.skip().await;
+                                }
                             }
                             VoiceTask::Previous(_, _) => {
-                                todo!()
+                                if let Some(player) = &player {
+                                    player.back_skip().await;
+                                }
                             }
-                            VoiceTask::PausePlay(_, _) => {
-                                todo!()
+                            VoiceTask::PausePlay(guild, _) => {
+                                if let Some(player) = &player {
+                                    if let Err(e) = player.dynamic_pause_resume().await{
+                                        if let PlayerError::LavalinkError(_, _) = e{
+                                            return Either::Left((guild, e, lavalink))
+                                        }
+                                    }
+                                }
                             }
                             VoiceTask::Clear(_, _) => {
-                                todo!()
+                                if let Some(player) = &player {
+                                    player.clear_queue();
+                                }
                             }
                             VoiceTask::RepeatOne(_, _) => {
-                                todo!()
+                                if let Some(player) = &player{
+                                    player.playback(Playback::SingleLoop)
+                                }
                             }
                             VoiceTask::RepeatAll(_, _) => {
-                                todo!()
+                                if let Some(player) = &player{
+                                    player.playback(Playback::AllLoop)
+                                }
                             }
-                            VoiceTask::Search(_, _, _, _) => {
-                                todo!()
+                            VoiceTask::Search(_, _, query, callback) => {
+                                if let Some(player) = &player{
+                                    player.search(query, callback);
+                                }
                             }
                         }
                     }
@@ -488,7 +520,7 @@ async fn bot_guild_run_async(
                         }
                         LavalinkEvent::TrackEnd(end) => {
                             if let Some(player) = player.as_mut() {
-                                player.track_end(end);
+                                player.track_end(end).await;
                             }
                         }
                     },

@@ -24,7 +24,6 @@ use thiserror::Error;
 
 mod config;
 mod event_handler;
-mod event_handler_old;
 mod guild_handler;
 mod message_manager;
 mod player;

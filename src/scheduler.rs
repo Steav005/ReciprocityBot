@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use crate::scheduler::TaskError::FailedExecution;
-use arc_swap::ArcSwap;
 use arrayvec::ArrayVec;
 use async_compat::CompatExt;
 use futures::prelude::*;

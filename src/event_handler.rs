@@ -1,5 +1,6 @@
 use serenity::async_trait;
 
+use arraydeque::ArrayDeque;
 use log::{debug, error, info, warn};
 use serenity::client::EventHandler as SerenityEventHandler;
 use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ResumedEvent, VoiceState};
@@ -9,11 +10,9 @@ use smol::channel::{Receiver, SendError, Sender};
 use smol::lock::Mutex;
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
-use std::path::Iter;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use thiserror::Error;
-use arraydeque::ArrayDeque;
 
 pub const EVENT_STREAM_LIMIT: usize = 200;
 pub const CACHE_SIZE: usize = 100;
@@ -106,7 +105,7 @@ impl EventHandler {
                         if cache.iter().any(|i| i == &event) {
                             return Ok(());
                         }
-                        if cache.is_full(){
+                        if cache.is_full() {
                             cache.pop_back().expect("Cache is empty");
                         }
                         cache.push_front(event.clone()).expect("Cache is full");
