@@ -24,22 +24,31 @@ mod guild;
 mod lavalink_handler;
 mod lavalink_supervisor;
 mod player;
+mod player_manager;
 mod scheduler;
+mod task_handle;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    //TODO maybe use env for file name
+    //Get Config
     let file_name: String = String::from("example_config.yml");
     let config = Config::new(file_name)?;
 
+    //Build threaded RunTime
     let threaded_rt = tokio::runtime::Runtime::new()?;
 
+    //Async main block
     threaded_rt.block_on::<Pin<Box<dyn Future<Output = Result<(), ReciprocityError>>>>>(
         Box::pin(async {
+            //Make Oneshot Channel for occurring errors
             let (send_error, rec_error) = tokio::sync::oneshot::channel::<ReciprocityError>();
             let send_error = Arc::new(Mutex::new(Some(send_error)));
 
+            //Build EventHandler and Bots using the EventHandler
             let event_handler = EventHandler::new();
             let bots = build_bots(config.bots.values(), event_handler.clone()).await?;
 
+            //Build LavalinkEventHandler and LavalinkSupervisor using the EventHandler
             let lavalink_event_handler = LavalinkHandler::new();
             let lavalink_supervisor = LavalinkSupervisor::new(
                 bots.iter().map(|(id, _)| *id).collect(),
@@ -48,6 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await;
 
+            //Make Hashmap of bots with Key: BotID, Value: (Http, Songbird)
+            //Http is for actions by the respective bot and songbird is for voice related stuff
             let mut http_bots = HashMap::new();
             for (bot_id, client) in bots {
                 http_bots.insert(
@@ -65,28 +76,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
+            //Build every Guild
             for guild in config.guilds.values() {
                 let id = GuildId(guild.guild_id);
+                //Init Guild
                 let (r_guild, run) = ReciprocityGuild::new(
                     id,
                     http_bots.clone(),
+                    event_handler.clone(),
                     lavalink_supervisor.clone(),
                     config.clone(),
                 )
                 .map_err(|e| ReciprocityError::Guild(e, id))?;
 
+                //Add Guild to EventHandler and LavalinkEventHandler
                 event_handler.add_guild(id, Arc::new(r_guild.clone())).await;
                 lavalink_event_handler
                     .add_guild(id, Arc::new(r_guild))
                     .await;
 
+                //Spawn Task for Guild with error send for occurring errors
                 let send_error = send_error.clone();
-                threaded_rt.spawn(async move {
+                tokio::spawn(async move {
                     let error = ReciprocityError::Scheduler(run.await, id);
                     try_send_error(send_error, error).await;
                 });
             }
 
+            //Await Error and match it
             match rec_error.await {
                 Ok(err) => Err(err),
                 Err(rec_err) => Err(ReciprocityError::DroppedReceive(rec_err)),
@@ -111,6 +128,7 @@ enum ReciprocityError {
     DroppedReceive(RecvError),
 }
 
+///Tries sending an error, might fail if an error was already send before
 async fn try_send_error(
     send_error: Arc<Mutex<Option<OneShotSender<ReciprocityError>>>>,
     error: ReciprocityError,
@@ -127,6 +145,7 @@ async fn try_send_error(
     }
 }
 
+///Builds bots from token and with EventHandler
 async fn build_bots(
     bot_token: impl Iterator<Item = &String>,
     event_handler: EventHandler,

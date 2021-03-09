@@ -1,8 +1,8 @@
 use crate::config::Config;
-use crate::event_handler::{Event, GuildEventHandler};
+use crate::event_handler::{Event, EventHandler, GuildEventHandler};
 use crate::lavalink_handler::{GuildLavalinkHandler, LavalinkEvent};
 use crate::lavalink_supervisor::LavalinkSupervisor;
-use crate::player::Player;
+use crate::player_manager::{PlayerManager, PlayerMapError};
 use crate::scheduler::{SchedulerError, TaskScheduler};
 use futures::Future;
 use serenity::async_trait;
@@ -13,16 +13,15 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct ReciprocityGuild {
     id: GuildId,
     channel: ChannelId,
     bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+    event_handler: EventHandler,
     scheduler: TaskScheduler,
-    lavalink_supervisor: LavalinkSupervisor,
-    player: Arc<HashMap<UserId, RwLock<Option<Player>>>>,
+    player_map: PlayerManager,
     config: Config,
 }
 
@@ -32,6 +31,7 @@ impl ReciprocityGuild {
     pub fn new(
         id: GuildId,
         bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+        event_handler: EventHandler,
         lavalink_supervisor: LavalinkSupervisor,
         config: Config,
     ) -> Result<(ReciprocityGuild, SchedulerRun), ReciprocityGuildError> {
@@ -49,16 +49,16 @@ impl ReciprocityGuild {
             bots.values().map(|(http, _)| http.clone()).collect(),
         );
 
-        let player: Arc<HashMap<_, _>> = Arc::new(bots.keys().map(|id| (*id, RwLock::new(None))).collect());
+        let player_map = PlayerManager::new(bots.clone(), lavalink_supervisor);
 
         Ok((
             ReciprocityGuild {
                 id,
                 channel,
                 bots,
+                event_handler,
                 scheduler,
-                lavalink_supervisor,
-                player,
+                player_map,
                 config,
             },
             run,
@@ -76,11 +76,13 @@ impl GuildEventHandler for ReciprocityGuild {
 pub enum ReciprocityGuildError {
     #[error("Guild was not found in config: {0:?}")]
     GuildNotInConfig(GuildId),
+    #[error("PlayerMap Error occurred: {0:?}")]
+    PlayerMap(PlayerMapError),
 }
 
 #[async_trait]
 impl GuildLavalinkHandler for ReciprocityGuild {
     async fn run(&self, event: LavalinkEvent) {
-        unimplemented!()
+        self.player_map.run(event).await;
     }
 }

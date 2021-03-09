@@ -33,3 +33,5 @@ impl Config {
         .map_err(|e| error_message(&e))?)
     }
 }
+
+//TODO add more stuff to the config

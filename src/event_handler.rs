@@ -2,7 +2,9 @@ use arraydeque::ArrayDeque;
 use log::{debug, error};
 use serenity::async_trait;
 use serenity::client::EventHandler as SerenityEventHandler;
-use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ResumedEvent, VoiceState};
+use serenity::model::prelude::{
+    ChannelId, Guild, GuildId, Message, MessageId, ResumedEvent, UserId, VoiceState,
+};
 use serenity::prelude::Context;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,10 +16,12 @@ pub const CACHE_SIZE: usize = 100;
 
 type Cache = Arc<Mutex<ArrayDeque<[Event; CACHE_SIZE]>>>;
 type EventHandlerGuild = (Cache, Arc<dyn GuildEventHandler>);
+type GuildVoiceCache = RwLock<HashMap<UserId, VoiceState>>;
 
 #[derive(Clone)]
 pub struct EventHandler {
     cache: Arc<RwLock<HashMap<GuildId, EventHandlerGuild>>>,
+    voice_state_cache: Arc<RwLock<HashMap<GuildId, GuildVoiceCache>>>,
 }
 
 #[derive(Error, Debug)]
@@ -60,6 +64,7 @@ impl EventHandler {
     pub fn new() -> EventHandler {
         EventHandler {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            voice_state_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -93,6 +98,15 @@ impl EventHandler {
         }
     }
 
+    pub async fn get_voice_state(&self, guild: GuildId, user: UserId) -> Option<VoiceState> {
+        if let Some(guild) = self.voice_state_cache.read().await.get(&guild) {
+            if let Some(voice_state) = guild.read().await.get(&user) {
+                return Some(voice_state.clone());
+            }
+        }
+        None
+    }
+
     fn handle_result(result: Result<(), EventHandlerError>) {
         if let Err(e) = result {
             debug!("{:?}", e);
@@ -107,7 +121,24 @@ pub trait GuildEventHandler: Send + Sync {
 
 #[async_trait]
 impl SerenityEventHandler for EventHandler {
-    async fn message(&self, _ctx: Context, new_message: Message) {
+    async fn guild_create(&self, _: Context, guild: Guild) {
+        //Check if Guild does not exists in Map yet
+        if self.voice_state_cache.read().await.get(&guild.id).is_none() {
+            let mut map_write_lock = self.voice_state_cache.write().await;
+            //Again, check if it is indeed empty
+            if map_write_lock.get(&guild.id).is_none() {
+                //If so, initialize guild
+                map_write_lock.insert(guild.id, RwLock::new(guild.voice_states));
+                return;
+            }
+        }
+
+        if let Some(guild_map) = self.voice_state_cache.read().await.get(&guild.id) {
+            guild_map.write().await.extend(guild.voice_states);
+        }
+    }
+
+    async fn message(&self, _: Context, new_message: Message) {
         let guild_id = match new_message.guild_id {
             Some(guild_id) => guild_id,
             None => return,
@@ -119,7 +150,7 @@ impl SerenityEventHandler for EventHandler {
 
     async fn message_delete(
         &self,
-        _ctx: Context,
+        _: Context,
         channel_id: ChannelId,
         deleted_message_id: MessageId,
         guild_id: Option<GuildId>,
@@ -143,13 +174,19 @@ impl SerenityEventHandler for EventHandler {
         }
     }
 
-    async fn voice_state_update(&self, _ctx: Context, guild_id: Option<GuildId>, v: VoiceState) {
+    async fn voice_state_update(&self, _: Context, guild_id: Option<GuildId>, v: VoiceState) {
         let guild_id = match guild_id {
             Some(guild_id) => guild_id,
             None => return,
         };
-        let event = Event::VoiceUpdate(v);
 
+        //Update Cache
+        if let Some(guild_map) = self.voice_state_cache.read().await.get(&guild_id) {
+            guild_map.write().await.insert(v.user_id, v.clone());
+        }
+
+        //Send Event to Guild
+        let event = Event::VoiceUpdate(v);
         EventHandler::handle_result(self.process(guild_id, event).await);
     }
 }
