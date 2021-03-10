@@ -47,11 +47,6 @@ impl ReciprocityGuild {
                 .collect(),
         );
 
-        scheduler.process(DeleteMessageTask {
-            message: MessageId(0),
-            channel: ChannelId(0),
-        });
-
         let player_map = PlayerManager::new(id, bots.clone(), lavalink_supervisor);
 
         Ok(ReciprocityGuild {

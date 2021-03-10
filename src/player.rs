@@ -6,7 +6,7 @@ use lavalink_rs::LavalinkClient;
 use serenity::model::prelude::{ChannelId, GuildId};
 use songbird::error::JoinError;
 use songbird::Songbird;
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::BorrowMut;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -104,30 +104,30 @@ impl Player {
     }
 
     pub async fn skip(&mut self) {
+        //If loop is one, move the current track to history, so a new Track gets played
+        if let Playback::OneLoop = self.playback {
+            if let Some((_, track)) = self.current.take() {
+                if self.history.is_full() {
+                    self.history.pop_back().expect("History is empty");
+                }
+                self.history.push_front(track).expect("History is full");
+                self.change.notify_waiters();
+            }
+        }
+
         if self.lavalink.skip(self.guild).await.is_some() {
             //Ignore
         }
     }
 
-    async fn move_track_forward(&mut self) {
-        todo!()
-    }
-
-    async fn move_track_backwards(&mut self) {
-        todo!()
-    }
-
     pub async fn back_skip(&mut self) {
         let mut changed = false;
 
-        if let Some((_, track)) = self.current.borrow() {
+        if let Some((_, track)) = self.current.take() {
             if self.playlist.is_full() {
                 self.playlist.pop_back().expect("Playlist is empty");
             }
-            self.playlist
-                .push_front(track.clone())
-                .expect("Playlist is full");
-            self.current = None;
+            self.playlist.push_front(track).expect("Playlist is full");
             changed = true;
         }
 
@@ -214,28 +214,51 @@ impl Player {
 
     pub async fn play_next(&mut self) -> Result<(), PlayerError> {
         let mut changed = false;
-        if let Some((_, track)) = self.current.borrow() {
-            if self.history.is_full() {
-                self.history.pop_back().expect("History is empty");
+
+        match self.playback {
+            //Add Current to History
+            Playback::Normal => {
+                if let Some((_, track)) = self.current.take() {
+                    if self.history.is_full() {
+                        self.history.pop_back().expect("History is empty");
+                    }
+                    self.history.push_front(track).expect("History is full");
+                    changed = true;
+                }
             }
-            self.history
-                .push_front(track.clone())
-                .expect("History is full");
-            self.current = None;
-            changed = true;
+            //Add Current to Playlist
+            Playback::AllLoop => {
+                if let Some((_, track)) = self.current.take() {
+                    if self.playlist.is_full() {
+                        self.playlist.pop_back().expect("Playlist is empty");
+                    }
+                    self.playlist.push_back(track).expect("Playlist is full");
+                    changed = true;
+                }
+            }
+            //Reset Duration of Current
+            Playback::OneLoop => {
+                if let Some((duration, _)) = self.current.borrow_mut() {
+                    *duration = Duration::from_secs(0);
+                }
+            }
         }
 
-        if let Some(track) = self.playlist.pop_front() {
-            self.current = Some((Duration::from_secs(0), track));
-            self.play_state = PlayState::Play;
-            changed = true;
+        //If current is None: Pull new one from Playlist
+        if self.current.is_none() {
+            if let Some(track) = self.playlist.pop_front() {
+                self.current = Some((Duration::from_secs(0), track));
+                self.play_state = PlayState::Play;
+                changed = true;
+            }
         }
 
         if changed {
             self.change.notify_waiters();
         }
 
-        match self.current.borrow() {
+        //Start if Current is some. Stop is Current is none.
+        match self.current.take() {
             None => self
                 .lavalink
                 .stop(self.guild)
@@ -243,7 +266,7 @@ impl Player {
                 .map_err(PlayerError::Lavalink),
             Some((_, track)) => self
                 .lavalink
-                .play(self.guild, track.clone())
+                .play(self.guild, track)
                 .start()
                 .await
                 .map_err(PlayerError::Lavalink),
