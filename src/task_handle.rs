@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error};
 use serde_json::Value;
 use serenity::async_trait;
 use serenity::http::routing::Route;
@@ -14,9 +14,10 @@ use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender}
 
 type PinedTask = Pin<Box<dyn Task>>;
 
+#[derive(Debug)]
 pub struct TaskHandle {
-    sender: OneShotSender<Result<PinedTask, TaskHandlerError>>,
-    task: PinedTask,
+    sender: Option<OneShotSender<Result<PinedTask, TaskHandlerError>>>,
+    task: Option<PinedTask>,
 }
 
 impl TaskHandle {
@@ -27,52 +28,48 @@ impl TaskHandle {
         OneShotReceiver<Result<PinedTask, TaskHandlerError>>,
     ) {
         let (sender, receive) = tokio::sync::oneshot::channel();
+
         (
             TaskHandle {
-                sender,
-                task: Box::pin(task),
+                sender: Some(sender),
+                task: Some(Box::pin(task)),
             },
             receive,
         )
     }
 
     ///Tries to complete the Task with the help of an Http Instance
-    pub async fn run(self, client: Arc<Http>) -> Result<(), ()> {
-        let mut task = self.task;
-        let result = task
-            .run(client.clone())
-            .await
-            .map(|_| task)
-            .map_err(TaskHandlerError::FailedExecution);
+    pub async fn run(mut self, client: Arc<Http>) -> Result<(), ()> {
+        if let Some(mut task) = self.task.take() {
+            let result = task
+                .run(client.clone())
+                .await
+                .map(|_| task)
+                .map_err(TaskHandlerError::FailedExecution);
 
-        let mut ret = Ok(());
-        if result.is_err() {
-            ret = Err(());
+            let mut ret = Ok(());
+            if result.is_err() {
+                ret = Err(());
+            }
+
+            if let Some(sender) = self.sender.take() {
+                if let Err(err) = sender.send(result) {
+                    debug!("Task Error Result was dropped: {:?}", err);
+                }
+            }
+
+            return ret;
         }
-
-        if let Err(err) = self.sender.send(result) {
-            debug!("Task Error Result was dropped: {:?}", err);
-        }
-
-        ret
+        Ok(())
     }
+}
 
-    ///Returns the Route, the underlying Task requires
-    pub fn get_route(&self) -> Routes {
-        self.task.route()
-    }
-
-    pub fn drop_no_bot(self) {
-        info!("Dropping {:?}, Reason: No Bot Exists", self.task);
-        if let Err(err) = self.sender.send(Err(TaskHandlerError::NoBotFound())) {
-            debug!("Task Error was dropped: {:?}", err.unwrap_err())
-        }
-    }
-
-    pub fn drop(self) {
-        info!("Dropping Task: {:?}", self.task);
-        if let Err(err) = self.sender.send(Err(TaskHandlerError::Dropped())) {
-            debug!("Task Error was dropped: {:?}", err.unwrap_err())
+impl Drop for TaskHandle {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            if let Err(err) = sender.send(Err(TaskHandlerError::Dropped(self.task.take()))) {
+                debug!("Task Error was dropped: {:?}", err.unwrap_err())
+            }
         }
     }
 }
@@ -82,28 +79,24 @@ impl TaskHandle {
 pub enum TaskHandlerError {
     #[error("Execution of the Task failed: Serenity Error: {0:?}")]
     FailedExecution(SerenityError),
-    #[error("Task is already complete")]
-    TaskAlreadyComplete(),
-    #[error("No Bot found")]
-    NoBotFound(),
-    #[error("The Task was dropped before execution")]
-    Dropped(),
+    #[error("The Task was dropped: {0:?}")]
+    Dropped(Option<Pin<Box<dyn Task>>>),
 }
 
 ///All the Routes which will be used by any Task
 #[derive(EnumIter, EnumCountMacro, Copy, Clone, Debug, Hash, Eq, PartialEq)]
-pub enum Routes {
+pub enum TaskRoute {
     ChannelMessageReaction,
     ChannelMessage,
     ChannelMessageReactionSelf,
 }
 
-impl Routes {
+impl TaskRoute {
     pub fn get_serenity_route(&self, channel: ChannelId, _guild: GuildId) -> Route {
         match self {
-            Routes::ChannelMessageReaction => Route::ChannelsIdMessagesIdReactions(channel.0),
-            Routes::ChannelMessage => Route::ChannelsIdMessages(channel.0),
-            Routes::ChannelMessageReactionSelf => {
+            TaskRoute::ChannelMessageReaction => Route::ChannelsIdMessagesIdReactions(channel.0),
+            TaskRoute::ChannelMessage => Route::ChannelsIdMessages(channel.0),
+            TaskRoute::ChannelMessageReactionSelf => {
                 Route::ChannelsIdMessagesIdReactionsUserIdType(channel.0)
             }
         }
@@ -114,7 +107,7 @@ impl Routes {
 pub trait Task: Send + Sync + Unpin + Debug {
     async fn run(&mut self, client: Arc<Http>) -> Result<(), SerenityError>;
 
-    fn route(&self) -> Routes;
+    fn route(&self) -> TaskRoute;
 }
 
 #[derive(Debug)]
@@ -138,8 +131,8 @@ impl Task for DeleteMessageReactionTask {
             .await
     }
 
-    fn route(&self) -> Routes {
-        Routes::ChannelMessageReaction
+    fn route(&self) -> TaskRoute {
+        TaskRoute::ChannelMessageReaction
     }
 }
 
@@ -155,8 +148,8 @@ impl Task for DeleteMessageTask {
         client.delete_message(self.channel.0, self.message.0).await
     }
 
-    fn route(&self) -> Routes {
-        Routes::ChannelMessage
+    fn route(&self) -> TaskRoute {
+        TaskRoute::ChannelMessage
     }
 }
 
@@ -175,8 +168,8 @@ impl Task for AddMessageReactionTask {
             .await
     }
 
-    fn route(&self) -> Routes {
-        Routes::ChannelMessageReactionSelf
+    fn route(&self) -> TaskRoute {
+        TaskRoute::ChannelMessageReactionSelf
     }
 }
 
@@ -195,7 +188,7 @@ impl Task for SendDMTask {
             .map(|_| ())
     }
 
-    fn route(&self) -> Routes {
-        Routes::ChannelMessage
+    fn route(&self) -> TaskRoute {
+        TaskRoute::ChannelMessage
     }
 }

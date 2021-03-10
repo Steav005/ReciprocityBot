@@ -3,14 +3,12 @@ use crate::event_handler::{Event, EventHandler, GuildEventHandler};
 use crate::lavalink_handler::{GuildLavalinkHandler, LavalinkEvent};
 use crate::lavalink_supervisor::LavalinkSupervisor;
 use crate::player_manager::{PlayerManager, PlayerMapError};
-use crate::scheduler::{SchedulerError, TaskScheduler};
-use futures::Future;
-use serenity::async_trait;
-use serenity::http::Http;
-use serenity::model::id::{ChannelId, GuildId, UserId};
+use crate::scheduler::GuildScheduler;
+use crate::task_handle::DeleteMessageTask;
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
+use serenity::{async_trait, CacheAndHttp};
 use songbird::Songbird;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -18,23 +16,21 @@ use thiserror::Error;
 pub struct ReciprocityGuild {
     id: GuildId,
     channel: ChannelId,
-    bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+    bots: HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>,
     event_handler: EventHandler,
-    scheduler: TaskScheduler,
+    scheduler: GuildScheduler,
     player_map: PlayerManager,
     config: Config,
 }
 
-type SchedulerRun = Pin<Box<dyn Future<Output = SchedulerError> + Send>>;
-
 impl ReciprocityGuild {
     pub fn new(
         id: GuildId,
-        bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+        bots: HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>,
         event_handler: EventHandler,
         lavalink_supervisor: LavalinkSupervisor,
         config: Config,
-    ) -> Result<(ReciprocityGuild, SchedulerRun), ReciprocityGuildError> {
+    ) -> Result<ReciprocityGuild, ReciprocityGuildError> {
         let channel = config
             .guilds
             .values()
@@ -43,33 +39,44 @@ impl ReciprocityGuild {
             .ok_or(ReciprocityGuildError::GuildNotInConfig(id))?
             .1;
 
-        let (scheduler, run) = TaskScheduler::new(
+        let scheduler = GuildScheduler::new(
             id,
             channel,
-            bots.values().map(|(http, _)| http.clone()).collect(),
+            bots.values()
+                .map(|(cache_http, _)| cache_http.clone())
+                .collect(),
         );
 
-        let player_map = PlayerManager::new(bots.clone(), lavalink_supervisor);
+        scheduler.process(DeleteMessageTask {
+            message: MessageId(0),
+            channel: ChannelId(0),
+        });
 
-        Ok((
-            ReciprocityGuild {
-                id,
-                channel,
-                bots,
-                event_handler,
-                scheduler,
-                player_map,
-                config,
-            },
-            run,
-        ))
+        let player_map = PlayerManager::new(id, bots.clone(), lavalink_supervisor);
+
+        Ok(ReciprocityGuild {
+            id,
+            channel,
+            bots,
+            event_handler,
+            scheduler,
+            player_map,
+            config,
+        })
     }
 }
 
 #[async_trait]
 impl GuildEventHandler for ReciprocityGuild {
     async fn run(&self, event: Event) {
-        unimplemented!()
+        match event {
+            Event::NewMessage(_) => {}
+            Event::DeleteMessage(_, _) => {}
+            Event::Resume(_, _) => {}
+            Event::VoiceUpdate(_, _) => {}
+        }
+
+        todo!()
     }
 }
 #[derive(Debug, Error)]

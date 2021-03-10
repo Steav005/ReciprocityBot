@@ -109,6 +109,14 @@ impl Player {
         }
     }
 
+    async fn move_track_forward(&mut self) {
+        todo!()
+    }
+
+    async fn move_track_backwards(&mut self) {
+        todo!()
+    }
+
     pub async fn back_skip(&mut self) {
         let mut changed = false;
 
@@ -262,7 +270,7 @@ impl Player {
         }
     }
 
-    pub async fn track_end(&mut self, end: TrackFinish) -> Result<(), PlayerError> {
+    pub async fn track_end(&mut self, _end: TrackFinish) -> Result<(), PlayerError> {
         self.play_next().await
     }
 

@@ -1,13 +1,12 @@
-use crate::guild::ReciprocityGuildError::PlayerMap;
 use crate::lavalink_handler::{GuildLavalinkHandler, LavalinkEvent};
 use crate::lavalink_supervisor::LavalinkSupervisor;
 use crate::player::{Playback, Player, PlayerError};
 use lavalink_rs::model::Track;
 use lavalink_rs::LavalinkClient;
 use log::{error, warn};
-use serenity::async_trait;
-use serenity::http::Http;
-use serenity::model::prelude::{ChannelId, UserId};
+use rand::seq::SliceRandom;
+use serenity::model::prelude::{ChannelId, GuildId, UserId};
+use serenity::{async_trait, CacheAndHttp};
 use songbird::Songbird;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,14 +16,16 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 
 #[derive(Clone)]
 pub struct PlayerManager {
-    bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+    guild: GuildId,
+    bots: HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>,
     supervisor: LavalinkSupervisor,
     player_map: HashMap<UserId, Arc<RwLock<Option<Player>>>>,
 }
 
 impl PlayerManager {
     pub fn new(
-        bots: HashMap<UserId, (Arc<Http>, Arc<Songbird>)>,
+        guild: GuildId,
+        bots: HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>,
         supervisor: LavalinkSupervisor,
     ) -> PlayerManager {
         let player_map: HashMap<_, _> = bots
@@ -33,6 +34,7 @@ impl PlayerManager {
             .collect();
 
         PlayerManager {
+            guild,
             bots,
             supervisor,
             player_map,
@@ -40,16 +42,49 @@ impl PlayerManager {
     }
 
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
-        match request {
-            PlayerRequest::Join(_) => {}
-            PlayerRequest::Leave(_) => {}
-            PlayerRequest::Skip(_) => {}
-            PlayerRequest::BackSkip(_) => {}
-            PlayerRequest::ClearQueue(_) => {}
-            PlayerRequest::Playback(_, _) => {}
-            PlayerRequest::PauseResume(_) => {}
+        if let PlayerRequest::Join(channel) = request {
+            self.join_free_bot(channel).await
+        } else {
+            if let Some((_, player)) = self.get_player_channel(request.get_channel()).await {
+                let mut player = player.write().await;
+                let no_player_error = PlayerMapError::NoPlayerFound(request.get_channel());
+
+                return match request {
+                    PlayerRequest::Join(_) => Ok(()),
+                    PlayerRequest::Leave(_) => {
+                        player.take().ok_or(no_player_error)?.disconnect().await
+                    }
+                    PlayerRequest::Skip(_) => {
+                        (*player).as_mut().ok_or(no_player_error)?.skip().await;
+                        Ok(())
+                    }
+                    PlayerRequest::BackSkip(_) => {
+                        (*player).as_mut().ok_or(no_player_error)?.back_skip().await;
+                        Ok(())
+                    }
+                    PlayerRequest::ClearQueue(_) => {
+                        (*player).as_mut().ok_or(no_player_error)?.clear_queue();
+                        Ok(())
+                    }
+                    PlayerRequest::Playback(playback, _) => {
+                        (*player)
+                            .as_mut()
+                            .ok_or(no_player_error)?
+                            .playback(playback);
+                        Ok(())
+                    }
+                    PlayerRequest::PauseResume(_) => {
+                        (*player)
+                            .as_mut()
+                            .ok_or(no_player_error)?
+                            .dynamic_pause_resume()
+                            .await
+                    }
+                }
+                .map_err(PlayerMapError::PlayerError);
+            }
+            Ok(())
         }
-        todo!()
     }
 
     pub async fn search(
@@ -75,9 +110,38 @@ impl PlayerManager {
         }
     }
 
-    async fn free_bots(&self) -> Vec<UserId> {
-        //Problem: nicht garantiert, dass alle Bots in der Gilde present sind
-        todo!()
+    async fn join_free_bot(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
+        let mut bot_vec = self.player_map.iter().collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        bot_vec.shuffle(&mut rng);
+
+        for (bot, player) in bot_vec {
+            if player.read().await.is_none() {
+                if let Some((cache_http, songbird)) = self.bots.get(bot) {
+                    if cache_http
+                        .cache
+                        .guild_field(self.guild, |_| ())
+                        .await
+                        .is_some()
+                    {
+                        let mut lock = player.write().await;
+                        if lock.is_some() {
+                            continue;
+                        }
+                        if let Some(lavalink) = self.supervisor.request_current(*bot).await {
+                            *lock = Some(
+                                Player::new(channel, self.guild, songbird.clone(), lavalink)
+                                    .await
+                                    .map_err(PlayerMapError::PlayerError)?,
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(PlayerMapError::NoFreeBot())
     }
 
     pub async fn has_player(&self, channel: ChannelId) -> bool {
@@ -181,6 +245,20 @@ pub enum PlayerRequest {
     PauseResume(ChannelId),
 }
 
+impl PlayerRequest {
+    pub fn get_channel(&self) -> ChannelId {
+        match self {
+            PlayerRequest::Join(channel) => *channel,
+            PlayerRequest::Leave(channel) => *channel,
+            PlayerRequest::Skip(channel) => *channel,
+            PlayerRequest::BackSkip(channel) => *channel,
+            PlayerRequest::ClearQueue(channel) => *channel,
+            PlayerRequest::Playback(_, channel) => *channel,
+            PlayerRequest::PauseResume(channel) => *channel,
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum PlayerMapError {
     #[error("Bot is missing in Supervisor: {0:?}")]
@@ -191,4 +269,6 @@ pub enum PlayerMapError {
     SearchSenderDropped(RecvError),
     #[error("Player Error occurred: {0:?}")]
     PlayerError(PlayerError),
+    #[error("No free Bot available")]
+    NoFreeBot(),
 }
