@@ -1,13 +1,13 @@
-use crate::task_handle::{Task, TaskHandle, TaskHandlerError, TaskRoute};
-use futures::Future;
-use serenity::futures::stream::{Peekable, StreamExt};
-use serenity::model::prelude::{ChannelId, GuildId, UserId};
-use serenity::CacheAndHttp;
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::iter::Iterator;
 use std::pin::Pin;
 use std::sync::Arc;
+
+use serenity::async_trait;
+use serenity::futures::stream::StreamExt;
+use serenity::model::prelude::{ChannelId, GuildId};
+use serenity::CacheAndHttp;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -17,33 +17,48 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-#[derive(Clone)]
-pub struct GuildScheduler {
-    guild: GuildId,
-    channel: ChannelId,
-    route_scheduler: Arc<HashMap<TaskRoute, RouteScheduler>>,
+use crate::guild::ReciprocityGuild;
+use crate::task_handle::{Task, TaskHandle, TaskHandlerError, TaskRoute};
+
+#[async_trait]
+pub trait GuildScheduler: Send + Sync {
+    ///Inits Scheduler
+    /// - Creates Route Scheduler for every existing Route
+    fn init_scheduler(&mut self);
+
+    ///Process Task
+    /// - Returns Error, if channel is full
+    /// - Returns Task if run successfully
+    async fn process(
+        &self,
+        task: impl Task + 'static,
+    ) -> Result<Pin<Box<dyn Task>>, SchedulerError>;
 }
 
-impl GuildScheduler {
-    pub fn new(guild: GuildId, channel: ChannelId, bots: Vec<Arc<CacheAndHttp>>) -> GuildScheduler {
+#[async_trait]
+impl GuildScheduler for ReciprocityGuild {
+    fn init_scheduler(&mut self) {
         let routes: HashMap<_, _> = TaskRoute::iter()
             .map(|route| {
                 (
                     route,
-                    RouteScheduler::new(route, guild, channel, bots.clone()),
+                    RouteScheduler::new(
+                        route,
+                        self.id,
+                        self.channel,
+                        self.bots
+                            .values()
+                            .cloned()
+                            .map(|(cache_http, _)| cache_http)
+                            .collect(),
+                    ),
                 )
             })
             .collect();
-        let route_scheduler = Arc::new(routes);
-
-        GuildScheduler {
-            guild,
-            channel,
-            route_scheduler,
-        }
+        *self.route_scheduler.borrow_mut() = Arc::new(routes);
     }
 
-    pub async fn process(
+    async fn process(
         &self,
         task: impl Task + 'static,
     ) -> Result<Pin<Box<dyn Task>>, SchedulerError> {
@@ -63,7 +78,7 @@ impl GuildScheduler {
     }
 }
 
-struct RouteScheduler {
+pub(in crate::guild) struct RouteScheduler {
     send: Sender<TaskHandle>,
 }
 
@@ -118,9 +133,7 @@ impl RouteScheduler {
                     //Drop Lock so others can get more tasks
                     drop(receive_lock);
                     //Execute Task and ignore outcome
-                    if task.run(bot.http.clone()).await.is_ok() {
-                        //Ignore
-                    }
+                    task.run(bot.http.clone()).await.ok();
                 }
             });
         }

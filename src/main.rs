@@ -1,36 +1,37 @@
-use crate::config::Config;
-use crate::event_handler::EventHandler;
-use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
-use crate::lavalink_handler::LavalinkHandler;
-use crate::lavalink_supervisor::LavalinkSupervisor;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use futures::Future;
 use serenity::http::Http;
 use serenity::model::id::{GuildId, UserId};
 use serenity::prelude::{SerenityError, TypeMapKey};
 use serenity::{CacheAndHttp, Client};
 use songbird::{SerenityInit, Songbird, SongbirdKey};
-use std::collections::HashMap;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
+
+use crate::config::Config;
+use crate::event_handler::EventHandler;
+use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
+use crate::lavalink_handler::LavalinkHandler;
+use crate::lavalink_supervisor::LavalinkSupervisor;
 
 mod config;
 mod event_handler;
 mod guild;
 mod lavalink_handler;
 mod lavalink_supervisor;
-mod player;
-mod player_manager;
-mod scheduler;
-mod task_handle;
+pub mod player;
+pub mod task_handle;
+
+pub type BotList = Arc<HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     //TODO maybe use env for file name
     //Get Config
     let file_name: String = String::from("example_config.yml");
-    let config = Config::new(file_name)?;
+    let config = Arc::new(Config::new(file_name)?);
 
     //Build threaded RunTime
     let threaded_rt = tokio::runtime::Runtime::new()?;
@@ -42,13 +43,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let event_handler = EventHandler::new();
             let (bots, join_handles) =
                 start_bots(config.bots.values(), event_handler.clone()).await?;
+            let bots = Arc::new(bots);
 
             //Build LavalinkEventHandler and LavalinkSupervisor using the EventHandler
             let lavalink_event_handler = LavalinkHandler::new();
             let lavalink_supervisor = LavalinkSupervisor::new(
                 bots.iter().map(|(id, _)| *id).collect(),
                 lavalink_event_handler.clone(),
-                config.lavalink.clone(),
+                config.clone(),
             )
             .await;
 

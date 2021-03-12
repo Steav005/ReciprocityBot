@@ -1,8 +1,11 @@
 use arraydeque::ArrayDeque;
 use log::{debug, error};
 use serenity::async_trait;
+use serenity::client::bridge::gateway::ShardMessenger;
 use serenity::client::EventHandler as SerenityEventHandler;
-use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ResumedEvent, VoiceState};
+use serenity::model::prelude::{
+    ChannelId, GuildId, Message, MessageId, ResumedEvent, UserId, VoiceState,
+};
 use serenity::prelude::Context;
 use std::collections::HashMap;
 use std::ops::BitAnd;
@@ -15,9 +18,11 @@ pub const CACHE_SIZE: usize = 100;
 
 type Cache = Arc<Mutex<ArrayDeque<[Event; CACHE_SIZE]>>>;
 type EventHandlerGuild = (Cache, Arc<dyn GuildEventHandler>);
+type GuildShardSenderMap = RwLock<HashMap<UserId, (u64, ShardMessenger)>>;
 
 #[derive(Clone)]
 pub struct EventHandler {
+    shard_sender: Arc<RwLock<HashMap<GuildId, GuildShardSenderMap>>>,
     cache: Arc<RwLock<HashMap<GuildId, EventHandlerGuild>>>,
 }
 
@@ -65,6 +70,7 @@ impl PartialEq for Event {
 impl EventHandler {
     pub fn new() -> EventHandler {
         EventHandler {
+            shard_sender: Arc::new(RwLock::new(HashMap::new())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -75,6 +81,10 @@ impl EventHandler {
             .write()
             .await
             .insert(guild, (cache, event_handler));
+        self.shard_sender
+            .write()
+            .await
+            .insert(guild, RwLock::new(HashMap::new()));
     }
 
     async fn process(&self, guild: GuildId, event: Event) -> Result<(), EventHandlerError> {
@@ -104,6 +114,32 @@ impl EventHandler {
             debug!("{:?}", e);
         }
     }
+
+    pub async fn get_shard_sender(&self, guild: GuildId, bot: UserId) -> Option<ShardMessenger> {
+        if let Some(guild) = self.shard_sender.read().await.get(&guild) {
+            if let Some((_, shard)) = guild.read().await.get(&bot) {
+                return Some(shard.clone());
+            }
+        }
+        None
+    }
+
+    async fn replace_shard_sender(&self, ctx: Context, guild: GuildId) {
+        if let Some(guild) = self.shard_sender.read().await.get(&guild) {
+            let bot_id = ctx.cache.current_user_id().await;
+            let read_lock = guild.read().await;
+            if let Some((id, _)) = read_lock.get(&bot_id) {
+                let id = *id;
+                drop(read_lock);
+                if id != ctx.shard_id {
+                    guild
+                        .write()
+                        .await
+                        .insert(bot_id, (ctx.shard_id, ctx.shard));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -113,13 +149,14 @@ pub trait GuildEventHandler: Send + Sync {
 
 #[async_trait]
 impl SerenityEventHandler for EventHandler {
-    async fn message(&self, _: Context, new_message: Message) {
+    async fn message(&self, ctx: Context, new_message: Message) {
         let guild_id = match new_message.guild_id {
             Some(guild_id) => guild_id,
             None => return,
         };
-        let event = Event::NewMessage(new_message);
+        self.replace_shard_sender(ctx, guild_id).await;
 
+        let event = Event::NewMessage(new_message);
         EventHandler::handle_result(self.process(guild_id, event).await);
     }
 
