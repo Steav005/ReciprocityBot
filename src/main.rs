@@ -11,12 +11,14 @@ use songbird::{SerenityInit, Songbird, SongbirdKey};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::bots::{BotError, BotMap};
 use crate::config::Config;
 use crate::event_handler::EventHandler;
 use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
 use crate::lavalink_handler::LavalinkHandler;
 use crate::lavalink_supervisor::LavalinkSupervisor;
 
+mod bots;
 mod config;
 mod event_handler;
 mod guild;
@@ -24,8 +26,6 @@ mod lavalink_handler;
 mod lavalink_supervisor;
 pub mod player;
 pub mod task_handle;
-
-pub type BotList = Arc<HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>>;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     //TODO maybe use env for file name
@@ -43,16 +43,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let event_handler = EventHandler::new();
             let (bots, join_handles) =
                 start_bots(config.bots.values(), event_handler.clone()).await?;
-            let bots = Arc::new(bots);
 
             //Build LavalinkEventHandler and LavalinkSupervisor using the EventHandler
             let lavalink_event_handler = LavalinkHandler::new();
-            let lavalink_supervisor = LavalinkSupervisor::new(
-                bots.iter().map(|(id, _)| *id).collect(),
-                lavalink_event_handler.clone(),
-                config.clone(),
-            )
-            .await;
+            let lavalink_supervisor =
+                LavalinkSupervisor::new(bots.ids(), lavalink_event_handler.clone(), config.clone())
+                    .await;
 
             //Build every Guild
             for guild in config.guilds.values() {
@@ -95,53 +91,24 @@ enum ReciprocityError {
     Guild(ReciprocityGuildError, GuildId),
     #[error("Join Error occurred for Client future: {0:?}")]
     JoinErrorClient(JoinError),
-}
-
-pub struct BotUserId;
-impl TypeMapKey for BotUserId {
-    type Value = UserId;
+    #[error("Error creating Bots: {0:?}")]
+    BotCreateError(BotError),
 }
 
 ///Builds and starts bots from token and with EventHandler
 async fn start_bots(
     bot_token: impl Iterator<Item = &String>,
     event_handler: EventHandler,
-) -> Result<
-    (
-        HashMap<UserId, (Arc<CacheAndHttp>, Arc<Songbird>)>,
-        Vec<JoinHandle<Result<(), SerenityError>>>,
-    ),
-    ReciprocityError,
-> {
-    let mut bots = HashMap::new();
+) -> Result<(Arc<BotMap>, Vec<JoinHandle<Result<(), SerenityError>>>), ReciprocityError> {
+    let mut bots = BotMap::new(event_handler);
     let mut join_handle = Vec::new();
     for token in bot_token {
-        let id = Http::new_with_token(token)
-            .get_current_application_info()
-            .await
-            .map_err(ReciprocityError::Serenity)?
-            .id;
-        let mut client = Client::builder(token.clone())
-            .register_songbird()
-            .event_handler(event_handler.clone())
-            .await
-            .map_err(ReciprocityError::Serenity)?;
-        let http = client.cache_and_http.clone();
-        let songbird = client
-            .data
-            .read()
-            .await
-            .get::<SongbirdKey>()
-            .ok_or(ReciprocityError::Songbird(id))?
-            .clone();
-
-        client.data.write().await.insert::<BotUserId>(id);
-        join_handle.push(tokio::spawn(
-            async move { client.start_autosharded().await },
-        ));
-
-        bots.insert(id, (http, songbird));
+        join_handle.push(
+            bots.add_bot(token)
+                .await
+                .map_err(ReciprocityError::BotCreateError)?,
+        );
     }
 
-    Ok((bots, join_handle))
+    Ok((Arc::new(bots), join_handle))
 }

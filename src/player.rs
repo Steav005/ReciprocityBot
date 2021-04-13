@@ -11,6 +11,7 @@ use serenity::model::prelude::{ChannelId, GuildId, UserId};
 use songbird::error::JoinError;
 use songbird::Songbird;
 use thiserror::Error;
+use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 use tokio::sync::Notify;
 
 const MUSIC_QUEUE_LIMIT: usize = 100;
@@ -22,7 +23,8 @@ pub struct Player {
     songbird: Arc<Songbird>,
     player_state: PlayerState,
 
-    change: Arc<Notify>,
+    send: WatchSender<Arc<PlayerState>>,
+    receive: WatchReceiver<Arc<PlayerState>>,
 }
 
 impl Player {
@@ -32,7 +34,7 @@ impl Player {
         guild: GuildId,
         songbird: Arc<Songbird>,
         lavalink: LavalinkClient,
-    ) -> Result<(Player, PlayerState), PlayerError> {
+    ) -> Result<(Player, WatchReceiver<Arc<PlayerState>>), PlayerError> {
         let connection_info = songbird
             .join_gateway(guild, channel)
             .await
@@ -43,22 +45,25 @@ impl Player {
             .await
             .map_err(PlayerError::Lavalink)?;
 
+        let player_state = PlayerState::new(bot);
+        let (send, receive) = tokio::sync::watch::channel(Arc::new(player_state.clone()));
+
         let player = Player {
             channel,
             guild,
             lavalink,
             songbird,
-            player_state: PlayerState::new(bot),
+            player_state,
 
-            change: Arc::new(Notify::new()),
+            send,
+            receive: receive.clone(),
         };
-        let player_state = player.player_state.clone();
 
-        Ok((player, player_state))
+        Ok((player, receive))
     }
 
-    pub fn get_notify(&self) -> Arc<Notify> {
-        self.change.clone()
+    pub fn get_status_watch(&self) -> WatchReceiver<Arc<PlayerState>> {
+        self.receive.clone()
     }
 
     pub fn get_lavalink(&self) -> LavalinkClient {
@@ -73,36 +78,36 @@ impl Player {
         self.player_state.bot
     }
 
-    pub async fn resume(&mut self) -> Result<PlayerState, PlayerError> {
+    pub async fn resume(&mut self) -> Result<(), PlayerError> {
         self.lavalink
             .resume(self.guild)
             .await
             .map_err(PlayerError::Lavalink)?;
         self.player_state.play_state = PlayState::Play;
 
-        self.change.notify_waiters();
-        Ok(self.player_state.clone())
+        self.send.send(Arc::new(self.player_state.clone())).ok();
+        Ok(())
     }
 
-    pub async fn pause(&mut self) -> Result<PlayerState, PlayerError> {
+    pub async fn pause(&mut self) -> Result<(), PlayerError> {
         self.lavalink
             .pause(self.guild)
             .await
             .map_err(PlayerError::Lavalink)?;
         self.player_state.play_state = PlayState::Pause;
 
-        self.change.notify_waiters();
-        Ok(self.player_state.clone())
+        self.send.send(Arc::new(self.player_state.clone())).ok();
+        Ok(())
     }
 
-    pub async fn dynamic_pause_resume(&mut self) -> Result<PlayerState, PlayerError> {
+    pub async fn dynamic_pause_resume(&mut self) -> Result<(), PlayerError> {
         match self.player_state.play_state {
             PlayState::Play => self.pause().await,
             PlayState::Pause => self.resume().await,
         }
     }
 
-    pub async fn skip(&mut self) -> Result<Option<PlayerState>, PlayerError> {
+    pub async fn skip(&mut self) -> Result<(), PlayerError> {
         let mut return_state = None;
         //If loop is one, move the current track to history, so a new Track gets played
         if let Playback::OneLoop = self.player_state.playback {
@@ -117,7 +122,7 @@ impl Player {
                     .history
                     .push_front(track)
                     .expect("History is full");
-                self.change.notify_waiters();
+                self.send.send(Arc::new(self.player_state.clone())).ok();
                 return_state = Some(self.player_state.clone());
             }
         }
@@ -126,10 +131,9 @@ impl Player {
             .stop(self.guild)
             .await
             .map_err(PlayerError::Lavalink)
-            .map(|_| return_state)
     }
 
-    pub async fn back_skip(&mut self) -> Result<Option<PlayerState>, PlayerError> {
+    pub async fn back_skip(&mut self) -> Result<(), PlayerError> {
         let mut changed = false;
 
         if let Some((_, track)) = self.player_state.current.take() {
@@ -162,17 +166,16 @@ impl Player {
 
         let mut return_state = None;
         if changed {
-            self.change.notify_waiters();
+            self.send.send(Arc::new(self.player_state.clone())).ok();
             return_state = Some(self.player_state.clone())
         }
         self.lavalink
             .stop(self.guild)
             .await
             .map_err(PlayerError::Lavalink)
-            .map(|_| return_state)
     }
 
-    pub async fn enqueue(&mut self, track: Track) -> Result<PlayerState, PlayerError> {
+    pub async fn enqueue(&mut self, track: Track) -> Result<(), PlayerError> {
         self.player_state
             .playlist
             .push_back(track)
@@ -181,28 +184,25 @@ impl Player {
         if self.player_state.current.is_none() {
             self.play_next().await?;
         } else {
-            self.change.notify_waiters();
+            self.send.send(Arc::new(self.player_state.clone())).ok();
         }
-        Ok(self.player_state.clone())
+        Ok(())
     }
 
-    pub fn clear_queue(&mut self) -> Option<PlayerState> {
+    pub fn clear_queue(&mut self) {
         if !self.player_state.playlist.is_empty() {
             self.player_state.playlist.clear();
-            self.change.notify_waiters();
-            return Some(self.player_state.clone());
+            self.send.send(Arc::new(self.player_state.clone())).ok();
         }
-        None
     }
 
-    pub fn playback(&mut self, playback: Playback) -> PlayerState {
+    pub fn playback(&mut self, playback: Playback) {
         if self.player_state.playback != playback {
             self.player_state.playback = playback;
         } else {
             self.player_state.playback = Playback::Normal;
         }
-        self.change.notify_waiters();
-        self.player_state.clone()
+        self.send.send(Arc::new(self.player_state.clone())).ok();
     }
 
     pub async fn disconnect(self) -> Result<(), PlayerError> {
@@ -295,7 +295,7 @@ impl Player {
         }
 
         if changed {
-            self.change.notify_waiters();
+            self.send.send(Arc::new(self.player_state.clone())).ok();
         }
 
         //Start if Current is some. Stop is Current is none.
@@ -329,7 +329,7 @@ impl Player {
             if pos.as_secs() != new_pos.as_secs() {
                 *pos = new_pos;
 
-                self.change.notify_waiters();
+                self.send.send(Arc::new(self.player_state.clone())).ok();
             }
         }
     }
@@ -343,13 +343,13 @@ impl Player {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum PlayState {
     Play,
     Pause,
 }
 
-#[derive(Eq, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum Playback {
     Normal,
     AllLoop,
@@ -388,7 +388,7 @@ impl PlayerError {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PlayerState {
     pub bot: UserId,
     pub current: Option<(Duration, Track)>,

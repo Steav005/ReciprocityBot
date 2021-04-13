@@ -1,358 +1,76 @@
-use crate::guild::player_manager::PlayerManager;
+use crate::bots::{Bot, BotMap};
+use crate::event_handler::EventHandler;
+use crate::guild::player_manager::{PlayerManager, PlayerRequest, PlayerStates};
 use crate::guild::scheduler::GuildScheduler;
-use crate::guild::ReciprocityGuild;
+use crate::player::PlayerState;
 use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
-use crate::BotList;
+use futures::future::{BoxFuture, Either, Select, SelectAll};
 use futures::FutureExt;
 use futures::StreamExt;
-use lavalink_rs::model::Track;
+use lavalink_rs::model::{Play, Track};
 use serde_json::Value;
 use serenity::client::bridge::gateway::ShardMessenger;
-use serenity::client::Cache;
-use serenity::collector::ReactionAction;
+use serenity::collector::{ReactionAction, ReactionCollector};
+use serenity::http::Http;
 use serenity::model::guild::Target::Emoji;
-use serenity::model::prelude::{
-    ChannelId, CurrentUser, Message, MessageId, Reaction, ReactionType, User, UserId,
-};
+use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId, VoiceState};
+use serenity::model::Permissions;
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
-use serenity::{async_trait, CacheAndHttp};
-use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::borrow::{Borrow, BorrowMut};
 use std::convert::TryFrom;
 use std::future::Future;
+use std::iter::Map;
 use std::ops::{Deref, Index};
+use std::pin::Pin;
+use std::slice::IterMut;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::watch::error::RecvError;
+use tokio::sync::watch::{Receiver as WatchReceiver, Receiver};
+use serenity::model::guild::Member;
 
 const DELETE_MESSAGE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_TITLE_LIMIT: usize = 40;
 
-pub type SearchMessageMap = Arc<RwLock<HashMap<UserId, (MessageId, JoinHandle<()>)>>>;
-pub type MainMessageMutex = Arc<Mutex<Option<(MessageId, JoinHandle<()>)>>>;
-
-#[async_trait]
-pub trait MessageManager: Send + Sync {
-    ///Important Init call<br>
-    /// TODO überlegen was hier überhaupt gemacht wird
-    fn init_message_manager(&mut self);
-
-    /// Handles incoming message
-    /// - Check if message is not from our bot
-    /// - Check if channel fits<br>
-    /// - Sends Search Request Event to MessageEventHandler
-    /// - Deletes Message
-    async fn handle_message(&'static self, message: Message);
-
-    /// Creates Search Message for specific User by specific bot with specific Tracks
-    async fn create_search(&'static self, requester: UserId, bot: UserId, tracks: Vec<Track>);
-
-    /// Gets any deleted Message
-    /// - Checks if message is search message
-    /// - TODO Checks if message is main message
-    /// - Removes message and aborts message handle
-    async fn deleted_bot_message(&'static self, message: MessageId);
-}
-
-#[async_trait]
-impl MessageManager for ReciprocityGuild {
-    fn init_message_manager(&mut self) {
-        let bots: Vec<_> = self
-            .bots
-            .values()
-            .map(|(cache_http, _)| cache_http.clone())
-            .collect();
-
-        tokio::spawn(async move {});
-    }
-
-    async fn handle_message(&'static self, message: Message) {
-        //Exit if message is from our bot
-        if self.bots.contains_key(&message.author.id) {
-            return;
-        }
-        let delete_task = DeleteMessageTask {
-            channel: message.channel_id,
-            message: message.id,
-        };
-
-        tokio::spawn(self.run(MessageManagerEvent::SearchInput(
-            message.author.id,
-            message.content,
-        )));
-
-        tokio::time::sleep(DELETE_MESSAGE_DELAY).await;
-        self.process(delete_task).await.ok();
-    }
-
-    async fn create_search(&'static self, requester: UserId, bot: UserId, tracks: Vec<Track>) {
-        if let Some((cache_http, _)) = self.bots.get(&bot) {
-            if let Some(shard) = self.event_handler.get_shard_sender(self.id, bot).await {
-                let search = SearchMessage::start(
-                    self.channel,
-                    requester,
-                    (cache_http.clone(), shard),
-                    tracks,
-                    self.clone(),
-                    self.clone(),
-                );
-
-                if let Ok(search) = search.await {
-                    if let Some((_, old_search)) =
-                        self.search_messages.write().await.insert(requester, search)
-                    {
-                        old_search.abort();
-                    };
-                }
-            }
-        }
-    }
-
-    async fn deleted_bot_message(&'static self, message: MessageId) {
-        let lock = self.search_messages.read().await;
-        if let Some(key) = lock
-            .iter()
-            .find(|(_, (id, _))| message.eq(id))
-            .map(|(user, _)| user)
-            .cloned()
-        {
-            drop(lock);
-            let mut lock = self.search_messages.write().await;
-            if let Some((id, _)) = lock.get(&key) {
-                if message.eq(id) {
-                    if let Some((_, handle)) = lock.remove(&key) {
-                        drop(lock);
-                        handle.abort();
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum MessageManagerEvent {
-    PlayPauseClick(UserId),
-    PrevClick(UserId),
-    NextClick(UserId),
-    LoopAllClick(UserId),
-    LoopOneClick(UserId),
-    JoinClick(UserId),
-    LeaveClick(UserId),
-    SearchInput(UserId, String),
-    TrackSelect(UserId, Track),
-    ClearQueueClick(UserId),
-}
-
-#[async_trait]
-pub trait MessageEventHandler: Send + Sync {
-    async fn run(&self, event: MessageManagerEvent);
-}
-
-#[derive(Debug, Clone)]
-pub struct MainMessage<S, P>
-where
-    S: GuildScheduler + Clone + 'static,
-    P: PlayerManager + 'static,
-{
-    id: MessageId,
-    message: Message,
+///Adds a list of emotes to a message
+async fn add_emotes(
+    message: MessageId,
     channel: ChannelId,
-    scheduler: S,
-    player_manager: P,
+    emotes: Arc<Vec<EmoteAction>>,
+    scheduler: GuildScheduler,
+) {
+    for task in emotes.iter().map(|emote| AddMessageReactionTask {
+        channel,
+        message,
+        reaction: emote.reaction(),
+    }) {
+        //Add single emote and wait for completion
+        scheduler.process(task).await.ok();
+    }
 }
 
-#[derive(Error, Debug)]
-pub enum MainMessageError {
-    #[error("{0:?}")]
-    Serenity(SerenityError),
-    #[error("Could not find Bot for Guild")]
-    NoBot(),
-}
+pub struct SearchMessage;
 
-impl<S, P> MainMessage<S, P>
-where
-    S: GuildScheduler + Clone + 'static,
-    P: PlayerManager + 'static,
-{
-    async fn start(
+impl SearchMessage {
+    pub async fn search(
+        bot: Arc<Http>,
         channel: ChannelId,
-        bot: (Arc<CacheAndHttp>, ShardMessenger),
-        scheduler: S,
-        player_manager: P,
-        event_handler: impl MessageEventHandler + Clone + 'static,
-    ) -> Result<(MessageId, JoinHandle<()>), MainMessageError> {
-        let message = bot
-            .0
-            .http
-            .send_message(
-                channel.0,
-                &Self::generate_content(&player_manager, bot.0.cache.clone()).await,
-            )
-            .await
-            .map_err(MainMessageError::Serenity)?;
-
-        let main = MainMessage {
-            id: message.id,
-            message: message.clone(),
-            channel,
-            scheduler: scheduler.clone(),
-            player_manager,
-        };
-
-        Ok((
-            message.id,
-            tokio::spawn(main.run(bot.1.clone(), event_handler)),
-        ))
-    }
-
-    async fn run(
-        self,
-        shard: ShardMessenger,
-        event_handler: impl MessageEventHandler + Clone + 'static,
-    ) {
-        let mut collector = self
-            .message
-            .clone()
-            .await_reactions(&shard)
-            .added(true)
-            .removed(true)
-            .await;
-
-        while let Some(reaction) = collector.next().await {
-            match reaction.as_ref() {
-                ReactionAction::Added(reaction) => {
-                    todo!("Filter Bots out");
-                    let reaction = reaction.deref().clone();
-                    tokio::spawn(Self::delete_reaction(
-                        reaction.clone(),
-                        self.scheduler.clone(),
-                    ));
-                    if let Some(user) = reaction.user_id {
-                        if let Ok(action) = EmoteAction::try_from(&reaction) {
-                            let event = match action {
-                                EmoteAction::PlayPause() => {
-                                    MessageManagerEvent::PlayPauseClick(user)
-                                }
-                                EmoteAction::Next() => MessageManagerEvent::NextClick(user),
-                                EmoteAction::Prev() => MessageManagerEvent::PrevClick(user),
-                                EmoteAction::Join() => MessageManagerEvent::JoinClick(user),
-                                EmoteAction::Leave() => MessageManagerEvent::LeaveClick(user),
-                                EmoteAction::LoopOne() => MessageManagerEvent::LoopOneClick(user),
-                                EmoteAction::LoopAll() => MessageManagerEvent::LoopAllClick(user),
-                                EmoteAction::Nothing() => {
-                                    MessageManagerEvent::ClearQueueClick(user)
-                                }
-                                _ => continue,
-                            };
-                            tokio::spawn(Self::send_event(event, event_handler.clone()));
-                        }
-                    }
-                }
-                ReactionAction::Removed(_) => {
-                    todo!()
-                }
-            }
-        }
-    }
-
-    async fn send_event(event: MessageManagerEvent, event_handler: impl MessageEventHandler) {
-        event_handler.run(event).await;
-    }
-
-    async fn delete_reaction(reaction: Reaction, scheduler: impl GuildScheduler) {
-        if let Some(user) = reaction.user_id {
-            scheduler
-                .process(DeleteMessageReactionTask {
-                    channel: reaction.channel_id,
-                    message: reaction.message_id,
-                    user,
-                    reaction: reaction.emoji,
-                })
-                .await
-                .ok();
-        }
-    }
-
-    async fn generate_content(player_manager: &P, cache: Arc<Cache>) -> Value {
-        let mut content = String::default();
-        for (channel, state) in player_manager.get_all_player_states().await {
-            if let Some(user) = cache.user(state.bot).await {
-                let mut intermediary_content = String::default();
-                if let Some((dur, track)) = &state.current {}
-            }
-        }
-
-        todo!()
-    }
-}
-
-impl<S, P> Drop for MainMessage<S, P>
-where
-    S: GuildScheduler + Clone + 'static,
-    P: PlayerManager + 'static,
-{
-    fn drop(&mut self) {
-        delete_message(self.id, self.channel, self.scheduler.clone())
-    }
-}
-
-#[derive(Debug)]
-struct SearchMessage<S>
-where
-    S: GuildScheduler + Clone + 'static,
-{
-    id: MessageId,
-    message: Message,
-    requester: UserId,
-    channel: ChannelId,
-    tracks: Arc<Vec<Track>>,
-    scheduler: S,
-}
-
-impl<S> SearchMessage<S>
-where
-    S: GuildScheduler + Clone + 'static,
-{
-    async fn start(
-        channel: ChannelId,
-        requester: UserId,
-        bot: (Arc<CacheAndHttp>, ShardMessenger),
         tracks: Vec<Track>,
-        scheduler: S,
-        event_handler: impl MessageEventHandler + 'static,
-    ) -> Result<(MessageId, JoinHandle<()>), SerenityError> {
-        //Create Search Message
+        requester: UserId,
+        shard_messenger: impl AsRef<ShardMessenger>,
+        scheduler: GuildScheduler,
+    ) -> Result<Track, MessageError> {
         let message = bot
-            .0
-            .http
-            .send_message(channel.0, &Self::generate_content(&tracks))
-            .await?;
-        let message_id = message.id;
+            .send_message(channel.0, &Self::content(&tracks))
+            .await
+            .map_err(MessageError::SerenityError)?;
 
-        let search = SearchMessage {
-            id: message_id,
-            message,
-            channel,
-            tracks: Arc::new(tracks),
-            requester,
-            scheduler,
-        };
-
-        Ok((
-            search.message.id,
-            tokio::spawn(search.run(bot.1, event_handler)),
-        ))
-    }
-
-    async fn run(self, shard: ShardMessenger, event_handler: impl MessageEventHandler + 'static) {
         //Build emotes, that we are using with this message
         let emotes: Arc<Vec<_>> = Arc::new(
-            (1..self.tracks.len())
+            (1..tracks.len())
                 .take(10)
                 .map(EmoteAction::Number)
                 .chain(vec![EmoteAction::Delete()])
@@ -360,29 +78,17 @@ where
         );
         let emotes_1 = emotes.clone();
 
-        //Build Collector
-        let tracks = self.tracks.clone();
-        let collector = self
-            .message
-            .clone()
-            .await_reaction(&shard)
+        let filter =
+            move |r: &Arc<Reaction>| emotes.iter().any(|e| r.emoji.unicode_eq(e.unicode()));
+        let collector = message
+            .await_reaction(&shard_messenger)
             .timeout(SEARCH_TIMEOUT)
-            .author_id(self.requester)
+            .author_id(requester.0)
             .removed(false)
             .added(true)
-            .filter(move |reaction| {
-                emotes
-                    .iter()
-                    .any(|e| reaction.emoji.unicode_eq(e.unicode()))
-            })
+            .filter(filter)
             //Map into EmoteAction
-            .map(|r| {
-                if let Some(r) = r {
-                    EmoteAction::try_from(r.as_inner_ref().deref()).ok()
-                } else {
-                    None
-                }
-            })
+            .map(|r| EmoteAction::try_from(r?.as_inner_ref().deref()).ok())
             //Map into Track
             .map(move |e| {
                 if let Some(EmoteAction::Number(i)) = e {
@@ -390,47 +96,26 @@ where
                 }
                 None
             });
-
-        //Add all emotes to the message
-        tokio::spawn(Self::add_emotes(
-            self.id,
-            self.channel,
-            emotes_1,
-            self.scheduler.clone(),
-        ));
-
-        //Await reaction and handle it
-        if let Some(track) = collector.await {
-            let requester = self.requester;
-            let event_handler = Box::pin(event_handler);
-
-            //Call EventHandler with selected Track
-            tokio::spawn(async move {
-                event_handler
-                    .run(MessageManagerEvent::TrackSelect(requester, track))
-                    .await;
-            });
-        }
-    }
-
-    ///Adds a list of emotes to a message
-    async fn add_emotes(
-        message: MessageId,
-        channel: ChannelId,
-        emotes: Arc<Vec<EmoteAction>>,
-        scheduler: impl GuildScheduler,
-    ) {
-        for task in emotes.iter().map(|emote| AddMessageReactionTask {
+        tokio::spawn(add_emotes(
+            message.id,
             channel,
-            message,
-            reaction: emote.reaction(),
-        }) {
-            //Add single emote and wait for completion
-            scheduler.process(task).await.ok();
-        }
+            emotes_1.clone(),
+            scheduler.clone(),
+        ));
+        let track: Result<Track, MessageError> = collector.await.ok_or(MessageError::Timeout());
+
+        scheduler
+            .process_enqueue(DeleteMessageTask {
+                channel,
+                message: message.id,
+            })
+            .await
+            .ok();
+
+        track
     }
 
-    fn generate_content(tracks: &[Track]) -> Value {
+    fn content(tracks: &[Track]) -> Value {
         let content: String = tracks
             .iter()
             .enumerate()
@@ -456,17 +141,232 @@ where
     }
 }
 
-///If dropped, try deleting the Message
-impl<S> Drop for SearchMessage<S>
-where
-    S: GuildScheduler + Clone + 'static,
-{
-    fn drop(&mut self) {
-        delete_message(self.id, self.channel, self.scheduler.clone());
+#[derive(Clone)]
+pub struct MainMessage{
+    guild: GuildId,
+    channel: ChannelId,
+    bots: Arc<BotMap>,
+    bot: Arc<Bot>,
+    shard: ShardMessenger,
+    player_manager: PlayerManager,
+    event_handler: EventHandler,
+    scheduler: GuildScheduler,
+}
+
+impl MainMessage {
+    pub async fn run(
+        guild: GuildId,
+        channel: ChannelId,
+        bots: Arc<BotMap>,
+        player_manager: PlayerManager,
+        event_handler: EventHandler,
+        scheduler: GuildScheduler,
+    ) -> MessageError {
+        if let Some(bot) = bots.get_any_guild_bot(&guild).await {
+            if let Some(shard) = event_handler.get_shard_sender(guild, bot.id()).await {
+                let main = MainMessage{
+                    guild,
+                    channel,
+                    bots,
+                    bot,
+                    shard,
+                    player_manager,
+                    event_handler,
+                    scheduler
+                };
+
+
+                return match main.run_internal()
+                    .await
+                {
+                    Ok(_) => MessageError::UnexpectedEnd(),
+                    Err(s) => MessageError::SerenityError(s),
+                };
+            }
+            return MessageError::NoShard(bot.id());
+        }
+        MessageError::NoBot(guild)
+    }
+
+    async fn run_internal(
+        self
+    ) -> Result<(), SerenityError> {
+        let player = self.player_manager.get_all_player_states().await;
+        let message = self.bot
+            .http()
+            .send_message(self.channel.0, &self.generate_content())
+            .await?;
+
+        let update_handle =
+            tokio::spawn(self.clone().run_update(message.id));
+
+        let emotes: Arc<Vec<_>> = Arc::new(vec![
+            EmoteAction::Prev(),
+            EmoteAction::PlayPause(),
+            EmoteAction::Next(),
+            EmoteAction::LoopOne(),
+            EmoteAction::LoopAll(),
+            EmoteAction::Join(),
+            EmoteAction::Leave(),
+            EmoteAction::Nothing(),
+        ]);
+
+        //Build Collector
+        let mut collector = message
+            .await_reactions(&self.shard)
+            .removed(true)
+            .added(true)
+            .await;
+        tokio::spawn(add_emotes(
+            message.id,
+            self.channel,
+            emotes.clone(),
+            self.scheduler.clone(),
+        ));
+
+        while let Some(reaction_action) = collector.next().await {
+            let action = EmoteAction::try_from(reaction_action.as_inner_ref().deref())
+                .ok()
+                .filter(|p| emotes.contains(p));
+            tokio::spawn(Self::handle_reaction_action(
+                self.clone(),
+                reaction_action,
+                action,
+                message.id,
+            ));
+        }
+
+        update_handle.abort();
+
+        Ok(())
+    }
+
+    async fn handle_reaction_action(
+        self,
+        reaction: Arc<ReactionAction>,
+        action: Option<EmoteAction>,
+        message: MessageId,
+    ) {
+        if let ReactionAction::Added(reaction) = reaction.as_ref() {
+            if let Some(user) = reaction.user_id {
+                if let Some(user) = self.bot.cache().user(user).await {
+                    if user.bot {
+                        return;
+                    }
+                }
+            }
+
+            self.scheduler.process_enqueue(DeleteMessageReactionTask{
+                channel: self.channel,
+                message,
+                user: reaction.user_id.unwrap_or_default(),
+                reaction: reaction.emoji.clone()
+            }).await.ok();
+
+            //if let Some(user) = reaction.user_id{
+            //    if let Some() = self.bots.get_user_voice_state(&user, &self.guild).await
+            //}
+
+            if let Some(action) = action{
+                match action{
+                    EmoteAction::PlayPause() => {}
+                    EmoteAction::Next() => {}
+                    EmoteAction::Prev() => {}
+                    EmoteAction::Join() => {}
+                    EmoteAction::Leave() => {}
+                    EmoteAction::Delete() => {}
+                    EmoteAction::LoopOne() => {}
+                    EmoteAction::LoopAll() => {}
+                    EmoteAction::Nothing() => {}
+                    _ => {}
+                }
+            }
+        }
+        todo!("What should be done if a bot emote was deleted")
+    }
+
+    async fn run_update(
+        self,
+        message: MessageId,
+    ) -> SerenityError {
+        //Prepare cloned player
+        let mut player = self.player_manager.get_all_player_states().await;
+        let cloned_player = player.clone();
+
+        //Pre clear changed
+        player
+            .changed()
+            .await
+            .expect("PlayerManager Status Sender dropped");
+        let mut players = player.borrow().clone();
+        //Pre clear changed for all players
+        let players_changed = players.iter_mut().map(|p| p.changed().boxed());
+        drop(futures::future::join_all(players_changed).await);
+
+        loop {
+            //create new changed for list and every single player
+            let players_changed = players.iter_mut().map(|p| p.changed().boxed());
+            let player_changed = player.changed().boxed();
+
+            //Update Message
+            if let Err(s) = self.bot
+                .cache_http()
+                .http
+                .edit_message(
+                    self.channel.0,
+                    message.0,
+                    &Self::generate_content(&self),
+                )
+                .await
+            {
+                return s;
+            }
+            //Await any Change
+            let changed = futures::future::select(
+                player_changed,
+                futures::future::select_all(players_changed),
+            )
+            .await;
+
+            //Check what changed
+            players = match changed {
+                Either::Left(_) => {
+                    drop(changed);
+                    //Create new players if list changed
+                    let mut players = player.borrow().clone();
+                    //Pre clear changed
+                    let players_changed = players.iter_mut().map(|p| p.changed().boxed());
+                    drop(futures::future::join_all(players_changed).await);
+                    players
+                }
+                Either::Right(_) => {
+                    drop(changed);
+                    players
+                }
+            };
+        }
+    }
+
+    fn generate_content(&self) -> Value {
+        todo!()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Error, Debug)]
+pub enum MessageError {
+    #[error("Serenity Error occurred: {0:?}")]
+    SerenityError(SerenityError),
+    #[error("Could not find Bot for Guild: {0:?}")]
+    NoBot(GuildId),
+    #[error("Could not find Shard for Bot: {0:?}")]
+    NoShard(UserId),
+    #[error("Message Timeout")]
+    Timeout(),
+    #[error("Unexpectedly ended")]
+    UnexpectedEnd(),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EmoteAction {
     Number(usize),
     PlayPause(),
@@ -546,15 +446,4 @@ impl TryFrom<&str> for EmoteAction {
             }
         }
     }
-}
-
-fn delete_message<S>(message: MessageId, channel: ChannelId, scheduler: S)
-where
-    S: GuildScheduler + 'static,
-{
-    tokio::spawn(async move {
-        scheduler
-            .process(DeleteMessageTask { channel, message })
-            .await
-    });
 }

@@ -27,10 +27,10 @@ impl Config {
         let error_message =
             |error: &dyn std::fmt::Display| format!("{}, file: {}", error.to_string(), file);
 
-        Ok(serde_yaml::from_reader(BufReader::new(
+        serde_yaml::from_reader(BufReader::new(
             File::open(&file).map_err(|e| error_message(&e))?,
         ))
-        .map_err(|e| error_message(&e))?)
+        .map_err(|e| error_message(&e))
     }
 }
 

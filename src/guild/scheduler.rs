@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serenity::async_trait;
 use serenity::futures::stream::StreamExt;
 use serenity::model::prelude::{ChannelId, GuildId};
+
 use serenity::CacheAndHttp;
 use strum::IntoEnumIterator;
 use thiserror::Error;
@@ -17,48 +18,36 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::bots::BotMap;
 use crate::guild::ReciprocityGuild;
 use crate::task_handle::{Task, TaskHandle, TaskHandlerError, TaskRoute};
 
-#[async_trait]
-pub trait GuildScheduler: Send + Sync {
-    ///Inits Scheduler
-    /// - Creates Route Scheduler for every existing Route
-    fn init_scheduler(&mut self);
-
-    ///Process Task
-    /// - Returns Error, if channel is full
-    /// - Returns Task if run successfully
-    async fn process(
-        &self,
-        task: impl Task + 'static,
-    ) -> Result<Pin<Box<dyn Task>>, SchedulerError>;
+#[derive(Clone)]
+pub struct GuildScheduler {
+    route_scheduler: Arc<HashMap<TaskRoute, RouteScheduler>>,
 }
 
-#[async_trait]
-impl GuildScheduler for ReciprocityGuild {
-    fn init_scheduler(&mut self) {
+impl GuildScheduler {
+    ///Inits Scheduler
+    /// - Creates Route Scheduler for every existing Route
+    pub fn new(guild: GuildId, channel: ChannelId, bots: Arc<BotMap>) -> Self {
         let routes: HashMap<_, _> = TaskRoute::iter()
             .map(|route| {
                 (
                     route,
-                    RouteScheduler::new(
-                        route,
-                        self.id,
-                        self.channel,
-                        self.bots
-                            .values()
-                            .cloned()
-                            .map(|(cache_http, _)| cache_http)
-                            .collect(),
-                    ),
+                    RouteScheduler::new(route, guild, channel, bots.clone()),
                 )
             })
             .collect();
-        *self.route_scheduler.borrow_mut() = Arc::new(routes);
+        GuildScheduler {
+            route_scheduler: Arc::new(routes),
+        }
     }
 
-    async fn process(
+    ///Process Task
+    /// - Returns Error, if channel is full
+    /// - Returns Task if run successfully
+    pub async fn process(
         &self,
         task: impl Task + 'static,
     ) -> Result<Pin<Box<dyn Task>>, SchedulerError> {
@@ -76,6 +65,17 @@ impl GuildScheduler for ReciprocityGuild {
         }
         Err(SchedulerError::NoRouteScheduler(route))
     }
+
+    pub async fn process_enqueue(&self, task: impl Task + 'static) -> Result<(), SchedulerError> {
+        let route = task.route();
+        let (handle, task_result) = TaskHandle::new(task);
+
+        if let Some(scheduler) = self.route_scheduler.get(&route) {
+            //Enqueue handle
+            return scheduler.enqueue(handle);
+        }
+        Err(SchedulerError::NoRouteScheduler(route))
+    }
 }
 
 pub(in crate::guild) struct RouteScheduler {
@@ -87,17 +87,17 @@ impl RouteScheduler {
         route: TaskRoute,
         guild: GuildId,
         channel: ChannelId,
-        mut bots: Vec<Arc<CacheAndHttp>>,
+        bots: Arc<BotMap>,
     ) -> RouteScheduler {
         let (send, receive): (Sender<TaskHandle>, Receiver<TaskHandle>) =
             tokio::sync::mpsc::channel(100);
         let receive = Arc::new(Mutex::new(ReceiverStream::new(receive).peekable()));
 
-        for bot in bots.drain(..) {
+        for bot in bots.bots() {
             let receive = receive.clone();
 
             let _: JoinHandle<Result<(), ()>> = tokio::spawn(async move {
-                let routes_map = bot.http.ratelimiter.routes();
+                let routes_map = bot.http().ratelimiter.routes();
                 let target_route = route.get_serenity_route(channel, guild);
                 loop {
                     if let Some(ratelimit) = routes_map.read().await.get(&target_route) {
@@ -123,7 +123,7 @@ impl RouteScheduler {
                         .await
                         .ok_or(())?;
                     //Check if we actually know this guild
-                    if bot.cache.guild_field(guild, |_| ()).await.is_none() {
+                    if bot.cache().guild_field(guild, |_| ()).await.is_none() {
                         //If not drop, drop lock and restart loop
                         drop(receive_lock);
                         continue;
@@ -133,7 +133,7 @@ impl RouteScheduler {
                     //Drop Lock so others can get more tasks
                     drop(receive_lock);
                     //Execute Task and ignore outcome
-                    task.run(bot.http.clone()).await.ok();
+                    task.run(bot.http().clone()).await.ok();
                 }
             });
         }
