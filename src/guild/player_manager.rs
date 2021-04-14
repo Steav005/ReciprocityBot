@@ -3,12 +3,13 @@ use crate::guild::message_manager::EmoteAction;
 use crate::guild::ReciprocityGuild;
 use crate::lavalink_handler::LavalinkEvent;
 use crate::lavalink_supervisor::LavalinkSupervisor;
+use crate::multi_key_map::{HashArc, TripleHashMap};
 use crate::player::{Playback, Player, PlayerError, PlayerState};
 use arc_swap::ArcSwap;
 use lavalink_rs::model::Track;
-use lavalink_rs::LavalinkClient;
+use lavalink_rs::{LavalinkClient, LavalinkClientInner};
 use log::error;
-use rand::seq::SliceRandom;
+use rand::prelude::SliceRandom;
 use serenity::async_trait;
 use serenity::model::prelude::{ChannelId, GuildId, UserId};
 use std::borrow::BorrowMut;
@@ -16,50 +17,55 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::oneshot::error::RecvError;
-use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
+use tokio::sync::watch::{Receiver as WatchReceiver, Receiver, Sender as WatchSender};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 pub type PlayerStates = Vec<WatchReceiver<Arc<PlayerState>>>;
+pub type PlayerMapType = TripleHashMap<
+    UserId,
+    HashArc<Mutex<LavalinkClientInner>>,
+    ChannelId,
+    Arc<RwLock<Option<Player>>>,
+>;
 
 #[derive(Clone)]
 pub struct PlayerManager {
     guild: GuildId,
     bots: Arc<BotMap>,
-    player_states_sender: Arc<Mutex<WatchSender<PlayerStates>>>,
-    player_states_receiver: WatchReceiver<PlayerStates>,
-    player: Arc<HashMap<UserId, Arc<RwLock<Option<Player>>>>>,
+    player_states: Arc<RwLock<PlayerStates>>,
+    player: Arc<RwLock<PlayerMapType>>,
     supervisor: LavalinkSupervisor,
 }
 
 impl PlayerManager {
     pub fn new(guild: GuildId, bots: Arc<BotMap>, supervisor: LavalinkSupervisor) -> Self {
-        let player = Arc::new(
-            bots.ids()
-                .iter()
-                .map(|id| (*id, Arc::new(RwLock::new(None))))
-                .collect(),
-        );
-
-        let (player_states_sender, player_states_receiver) =
-            tokio::sync::watch::channel(Vec::new());
-        let player_states_sender = Arc::new(Mutex::new(player_states_sender));
+        let mut player = TripleHashMap::new();
+        for bot in bots.ids() {
+            player.insert(bot, Arc::new(RwLock::new(None)))
+        }
+        let player = Arc::new(RwLock::new(player));
+        let player_states = Arc::new(RwLock::new(Vec::new()));
 
         PlayerManager {
             guild,
             bots,
             player,
             supervisor,
-
-            player_states_sender,
-            player_states_receiver,
+            player_states,
         }
     }
 
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
-        let player = self.get_player_by_channel(request.get_channel()).await;
+        let player = self
+            .player
+            .read()
+            .await
+            .get_k2(&request.get_channel())
+            .map(|(bot, player)| (*bot, player.clone()));
         let (bot, player) =
             player.ok_or_else(|| PlayerMapError::NoPlayerFound(request.get_channel()))?;
         let mut player_lock = player.write().await;
@@ -93,7 +99,10 @@ impl PlayerManager {
                 .map_err(PlayerMapError::PlayerError),
         };
         drop(player_lock);
-        self.handle_result(result, bot, lavalink).await
+        match result {
+            Err(e) => Err(self.handle_error(e, bot, lavalink).await),
+            Ok(_) => Ok(()),
+        }
     }
 
     pub async fn search(
@@ -102,8 +111,11 @@ impl PlayerManager {
         query: String,
     ) -> Result<(UserId, Vec<Track>), PlayerMapError> {
         let (bot, player) = self
-            .get_player_by_channel(channel)
+            .player
+            .read()
             .await
+            .get_k2(&channel)
+            .map(|(bot, player)| (*bot, player.clone()))
             .ok_or(PlayerMapError::NoPlayerFound(channel))?;
         let (send, rev) = tokio::sync::oneshot::channel();
         let player_lock = player.read().await;
@@ -116,29 +128,30 @@ impl PlayerManager {
 
         match rev.await {
             Ok(res) => {
-                self.handle_result(
-                    res.map_err(PlayerMapError::PlayerError)
-                        .map(|tracks| (bot, tracks)),
-                    bot,
-                    lavalink,
-                )
-                .await
+                let res = res
+                    .map_err(PlayerMapError::PlayerError)
+                    .map(|tracks| (bot, tracks));
+                match res {
+                    Err(e) => Err(self.handle_error(e, bot, lavalink).await),
+                    Ok(vec) => Ok(vec),
+                }
             }
             Err(rec_err) => Err(PlayerMapError::SearchSenderDropped(rec_err)),
         }
     }
 
-    async fn handle_result<T>(
+    async fn handle_error(
         &self,
-        error: Result<T, PlayerMapError>,
+        error: PlayerMapError,
         bot: UserId,
         lavalink: LavalinkClient,
-    ) -> Result<T, PlayerMapError> {
-        if let Err(PlayerMapError::PlayerError(player_error)) = &error {
+    ) -> PlayerMapError {
+        if let PlayerMapError::PlayerError(player_error) = &error {
             if player_error.is_fatal() {
-                if let Some(player) = self.player.get(&bot) {
+                if let Some(player) = self.player.read().await.get(&bot).cloned() {
                     if let Some(player) = player.write().await.take() {
                         player.disconnect().await.ok();
+                        self.player.write().await.sub_k1_k2(&bot);
                     }
                 };
                 self.supervisor.request_new(bot, lavalink).await;
@@ -148,7 +161,13 @@ impl PlayerManager {
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
-        let mut bot_vec = self.player.deref().clone().drain().collect::<Vec<_>>();
+        let mut bot_vec = self
+            .player
+            .read()
+            .await
+            .iter()
+            .map(|(bot, player)| (*bot, player.clone()))
+            .collect::<Vec<_>>();
         bot_vec.shuffle(rand::thread_rng().borrow_mut());
 
         for (bot, player) in bot_vec {
@@ -164,9 +183,10 @@ impl PlayerManager {
     }
 
     async fn add_player(&self, bot: UserId, channel: ChannelId) -> Result<(), PlayerMapError> {
-        let player = self
-            .player
+        let mut map_lock = self.player.write().await;
+        let player = map_lock
             .get(&bot)
+            .cloned()
             .ok_or(PlayerMapError::NoBotWithID(bot, self.guild))?;
         let mut lock = player.write().await;
         if lock.is_some() {
@@ -188,21 +208,36 @@ impl PlayerManager {
         let result = Player::new(bot, channel, self.guild, songbird, lavalink.clone())
             .await
             .map_err(PlayerMapError::PlayerError);
-        let (player, rec) = self.handle_result(result, bot, lavalink).await?;
+
+        let (player, rec) = match result {
+            Err(e) => {
+                drop(map_lock);
+                drop(lock);
+                return Err(self.handle_error(e, bot, lavalink).await);
+            },
+            Ok((player, rec)) => (player, rec),
+        };
+
         *lock = Some(player);
-        let state_lock = self.player_states_sender.lock().await;
-        let mut states = (*(state_lock.borrow())).clone();
+        let mut states = self.player_states.write().await;
         states.push(rec);
-        state_lock
-            .send(states)
-            .expect("PlayerStates Receiver dropped");
+        map_lock.add_k1_k2(bot, HashArc::from(lavalink.inner), channel);
 
         Ok(())
     }
 
     pub async fn leave(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
-        let player = self.get_player_by_channel(channel).await;
-        let (bot, player) = player.ok_or(PlayerMapError::NoPlayerFound(channel))?;
+        //Get bot and player while removing channel and lavalink form the HashMap
+        let (bot, player) = {
+            let mut lock = self.player.write().await;
+            let (bot, player) = lock
+                .get_k2(&channel)
+                .map(|(bot, player)| (*bot, player.clone()))
+                .ok_or(PlayerMapError::NoPlayerFound(channel))?;
+            lock.sub_k1_k2(&bot);
+            (bot, player)
+        };
+
         let mut player_lock = player.write().await;
         player_lock
             .take()
@@ -210,73 +245,54 @@ impl PlayerManager {
             .disconnect()
             .await
             .ok();
-        let state_lock = self.player_states_sender.lock().await;
-        let states: Vec<_> = (*(*state_lock.borrow()))
-            .iter()
-            .cloned()
+        let mut states = self.player_states.write().await;
+        *states = states
+            .drain(..)
             .filter(|s| !s.borrow().bot.eq(&bot))
             .collect();
-        state_lock.send(states).ok();
         Ok(())
     }
 
-    pub async fn get_all_player_states(&self) -> WatchReceiver<PlayerStates> {
-        self.player_states_receiver.clone()
+    pub async fn get_all_player_states(&self) -> PlayerStates {
+        self.player_states.read().await.clone()
     }
 
-    async fn get_player_by_channel(
+    pub async fn handle_player_event(
         &self,
-        channel: ChannelId,
-    ) -> Option<(UserId, Arc<RwLock<Option<Player>>>)> {
-        for (bot, player_lock) in self.player.iter() {
-            if let Some(player) = player_lock.read().await.as_ref() {
-                if channel == player.get_channel() {
-                    return Some((*bot, player_lock.clone()));
-                }
-            }
-        }
-        None
-    }
-
-    async fn get_player_by_lavalink(
-        &self,
-        lavalink: &LavalinkClient,
-    ) -> Option<(UserId, Arc<RwLock<Option<Player>>>)> {
-        for (bot, player_lock) in self.player.iter() {
-            if let Some(player) = player_lock.read().await.as_ref() {
-                if Arc::ptr_eq(&lavalink.inner, &player.get_lavalink().inner) {
-                    return Some((*bot, player_lock.clone()));
-                }
-            }
-        }
-        None
-    }
-
-    pub async fn handle_player_event(&self, event: LavalinkEvent) -> Result<(), ()> {
+        event: LavalinkEvent,
+        client: LavalinkClient,
+    ) -> Result<(), ()> {
         let (bot, player) = self
-            .get_player_by_lavalink(event.get_client())
+            .player
+            .read()
             .await
+            .get_k1(&HashArc::from(client.inner))
+            .map(|(bot, player)| (*bot, player.clone()))
             .ok_or(())?;
         let mut player_lock = player.write().await;
         let player = player_lock.as_mut().ok_or(())?;
         let lavalink = player.get_lavalink();
         let result = match event {
-            LavalinkEvent::PlayerUpdate(update, _) => {
+            LavalinkEvent::Update(update) => {
                 player.update(update);
                 Ok(())
             }
-            LavalinkEvent::TrackStart(start, _) => {
+            LavalinkEvent::Start(start) => {
                 player.track_start(start);
                 Ok(())
             }
-            LavalinkEvent::TrackFinish(finish, _) => player
+            LavalinkEvent::Finish(finish) => player
                 .track_end(finish)
                 .await
                 .map_err(PlayerMapError::PlayerError),
         };
-        self.handle_result(result, bot, lavalink)
-            .await
-            .map_err(|_| ())
+
+        if let Err(e) = result {
+            self.handle_error(e, bot, lavalink).await;
+            Err(())
+        } else {
+            Ok(())
+        }
     }
 }
 

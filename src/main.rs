@@ -20,10 +20,12 @@ use crate::lavalink_supervisor::LavalinkSupervisor;
 
 mod bots;
 mod config;
+mod context;
 mod event_handler;
 mod guild;
 mod lavalink_handler;
 mod lavalink_supervisor;
+mod multi_key_map;
 pub mod player;
 pub mod task_handle;
 

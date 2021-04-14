@@ -78,7 +78,7 @@ impl GuildScheduler {
     }
 }
 
-pub(in crate::guild) struct RouteScheduler {
+pub struct RouteScheduler {
     send: Sender<TaskHandle>,
 }
 

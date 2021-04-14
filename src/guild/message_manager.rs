@@ -12,8 +12,11 @@ use serde_json::Value;
 use serenity::client::bridge::gateway::ShardMessenger;
 use serenity::collector::{ReactionAction, ReactionCollector};
 use serenity::http::Http;
+use serenity::model::guild::Member;
 use serenity::model::guild::Target::Emoji;
-use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId, VoiceState};
+use serenity::model::prelude::{
+    ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId, VoiceState,
+};
 use serenity::model::Permissions;
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
@@ -29,7 +32,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch::error::RecvError;
 use tokio::sync::watch::{Receiver as WatchReceiver, Receiver};
-use serenity::model::guild::Member;
 
 const DELETE_MESSAGE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -142,7 +144,7 @@ impl SearchMessage {
 }
 
 #[derive(Clone)]
-pub struct MainMessage{
+pub struct MainMessage {
     guild: GuildId,
     channel: ChannelId,
     bots: Arc<BotMap>,
@@ -153,204 +155,7 @@ pub struct MainMessage{
     scheduler: GuildScheduler,
 }
 
-impl MainMessage {
-    pub async fn run(
-        guild: GuildId,
-        channel: ChannelId,
-        bots: Arc<BotMap>,
-        player_manager: PlayerManager,
-        event_handler: EventHandler,
-        scheduler: GuildScheduler,
-    ) -> MessageError {
-        if let Some(bot) = bots.get_any_guild_bot(&guild).await {
-            if let Some(shard) = event_handler.get_shard_sender(guild, bot.id()).await {
-                let main = MainMessage{
-                    guild,
-                    channel,
-                    bots,
-                    bot,
-                    shard,
-                    player_manager,
-                    event_handler,
-                    scheduler
-                };
-
-
-                return match main.run_internal()
-                    .await
-                {
-                    Ok(_) => MessageError::UnexpectedEnd(),
-                    Err(s) => MessageError::SerenityError(s),
-                };
-            }
-            return MessageError::NoShard(bot.id());
-        }
-        MessageError::NoBot(guild)
-    }
-
-    async fn run_internal(
-        self
-    ) -> Result<(), SerenityError> {
-        let player = self.player_manager.get_all_player_states().await;
-        let message = self.bot
-            .http()
-            .send_message(self.channel.0, &self.generate_content())
-            .await?;
-
-        let update_handle =
-            tokio::spawn(self.clone().run_update(message.id));
-
-        let emotes: Arc<Vec<_>> = Arc::new(vec![
-            EmoteAction::Prev(),
-            EmoteAction::PlayPause(),
-            EmoteAction::Next(),
-            EmoteAction::LoopOne(),
-            EmoteAction::LoopAll(),
-            EmoteAction::Join(),
-            EmoteAction::Leave(),
-            EmoteAction::Nothing(),
-        ]);
-
-        //Build Collector
-        let mut collector = message
-            .await_reactions(&self.shard)
-            .removed(true)
-            .added(true)
-            .await;
-        tokio::spawn(add_emotes(
-            message.id,
-            self.channel,
-            emotes.clone(),
-            self.scheduler.clone(),
-        ));
-
-        while let Some(reaction_action) = collector.next().await {
-            let action = EmoteAction::try_from(reaction_action.as_inner_ref().deref())
-                .ok()
-                .filter(|p| emotes.contains(p));
-            tokio::spawn(Self::handle_reaction_action(
-                self.clone(),
-                reaction_action,
-                action,
-                message.id,
-            ));
-        }
-
-        update_handle.abort();
-
-        Ok(())
-    }
-
-    async fn handle_reaction_action(
-        self,
-        reaction: Arc<ReactionAction>,
-        action: Option<EmoteAction>,
-        message: MessageId,
-    ) {
-        if let ReactionAction::Added(reaction) = reaction.as_ref() {
-            if let Some(user) = reaction.user_id {
-                if let Some(user) = self.bot.cache().user(user).await {
-                    if user.bot {
-                        return;
-                    }
-                }
-            }
-
-            self.scheduler.process_enqueue(DeleteMessageReactionTask{
-                channel: self.channel,
-                message,
-                user: reaction.user_id.unwrap_or_default(),
-                reaction: reaction.emoji.clone()
-            }).await.ok();
-
-            //if let Some(user) = reaction.user_id{
-            //    if let Some() = self.bots.get_user_voice_state(&user, &self.guild).await
-            //}
-
-            if let Some(action) = action{
-                match action{
-                    EmoteAction::PlayPause() => {}
-                    EmoteAction::Next() => {}
-                    EmoteAction::Prev() => {}
-                    EmoteAction::Join() => {}
-                    EmoteAction::Leave() => {}
-                    EmoteAction::Delete() => {}
-                    EmoteAction::LoopOne() => {}
-                    EmoteAction::LoopAll() => {}
-                    EmoteAction::Nothing() => {}
-                    _ => {}
-                }
-            }
-        }
-        todo!("What should be done if a bot emote was deleted")
-    }
-
-    async fn run_update(
-        self,
-        message: MessageId,
-    ) -> SerenityError {
-        //Prepare cloned player
-        let mut player = self.player_manager.get_all_player_states().await;
-        let cloned_player = player.clone();
-
-        //Pre clear changed
-        player
-            .changed()
-            .await
-            .expect("PlayerManager Status Sender dropped");
-        let mut players = player.borrow().clone();
-        //Pre clear changed for all players
-        let players_changed = players.iter_mut().map(|p| p.changed().boxed());
-        drop(futures::future::join_all(players_changed).await);
-
-        loop {
-            //create new changed for list and every single player
-            let players_changed = players.iter_mut().map(|p| p.changed().boxed());
-            let player_changed = player.changed().boxed();
-
-            //Update Message
-            if let Err(s) = self.bot
-                .cache_http()
-                .http
-                .edit_message(
-                    self.channel.0,
-                    message.0,
-                    &Self::generate_content(&self),
-                )
-                .await
-            {
-                return s;
-            }
-            //Await any Change
-            let changed = futures::future::select(
-                player_changed,
-                futures::future::select_all(players_changed),
-            )
-            .await;
-
-            //Check what changed
-            players = match changed {
-                Either::Left(_) => {
-                    drop(changed);
-                    //Create new players if list changed
-                    let mut players = player.borrow().clone();
-                    //Pre clear changed
-                    let players_changed = players.iter_mut().map(|p| p.changed().boxed());
-                    drop(futures::future::join_all(players_changed).await);
-                    players
-                }
-                Either::Right(_) => {
-                    drop(changed);
-                    players
-                }
-            };
-        }
-    }
-
-    fn generate_content(&self) -> Value {
-        todo!()
-    }
-}
+impl MainMessage {}
 
 #[derive(Error, Debug)]
 pub enum MessageError {

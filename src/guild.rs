@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serenity::model::id::{ChannelId, GuildId, UserId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::{async_trait, CacheAndHttp};
 use songbird::Songbird;
 use thiserror::Error;
@@ -11,31 +11,27 @@ use crate::task_handle::{DeleteMessageTask, TaskRoute};
 
 use crate::bots::BotMap;
 use crate::config::Config;
-use crate::event_handler::{Event, EventHandler, GuildEventHandler};
-use crate::guild::message_manager::SearchMessage;
+use crate::context::{Context, GuildEventHandler};
+use crate::event_handler::{Event, EventHandler};
+use crate::guild::message_manager::{MessageError, SearchMessage};
 use crate::guild::player_manager::{PlayerManager, PlayerRequest};
 use crate::guild::scheduler::GuildScheduler;
-use crate::lavalink_handler::{GuildLavalinkHandler, LavalinkEvent};
+use crate::lavalink_handler::LavalinkEvent;
 use crate::lavalink_supervisor::LavalinkSupervisor;
 use arc_swap::ArcSwap;
-use serenity::model::prelude::Message;
+use lavalink_rs::model::{PlayerUpdate, TrackFinish, TrackStart};
+use lavalink_rs::LavalinkClient;
+use serenity::model::event::ResumedEvent;
+use serenity::model::prelude::{Message, VoiceState};
 use std::ops::Not;
+use std::time::Instant;
 
-mod message_manager;
+pub mod message_manager;
 pub mod player_manager;
-mod scheduler;
+pub mod scheduler;
 
 #[derive(Clone)]
-pub struct ReciprocityGuild {
-    id: GuildId,
-    channel: ChannelId,
-    bots: Arc<BotMap>,
-    event_handler: EventHandler,
-    config: Arc<Config>,
-
-    scheduler: GuildScheduler,
-    player_manager: Arc<PlayerManager>,
-}
+pub struct ReciprocityGuild(Context);
 
 impl ReciprocityGuild {
     pub fn new(
@@ -57,90 +53,21 @@ impl ReciprocityGuild {
         let player_manager = Arc::new(PlayerManager::new(id, bots.clone(), lavalink_supervisor));
 
         let mut guild = ReciprocityGuild {
-            id,
-            channel,
-            bots,
-            event_handler,
-            config,
-            scheduler,
-            player_manager,
+            0: Context {
+                id,
+                channel,
+                bots,
+                event_handler,
+                config,
+                scheduler,
+                player_manager,
+            },
         };
 
         Ok(guild)
     }
-
-    async fn handle_new_message(&self, message: Message) -> Result<(), ()> {
-        let user = message.author.id;
-        if message.channel_id.eq(&self.channel).not() {
-            return Err(());
-        }
-        if self.bots.contains_id(&user) {
-            return Err(());
-        }
-        self.scheduler
-            .process_enqueue(DeleteMessageTask {
-                channel: message.channel_id,
-                message: message.id,
-            })
-            .await
-            .ok();
-        let voice_channel = self
-            .bots
-            .get_user_voice_state(&user, &self.id)
-            .await
-            .map(|v| v.channel_id)
-            .flatten()
-            .ok_or(())?;
-        let (bot, tracks) = self
-            .player_manager
-            .search(voice_channel, message.content)
-            .await
-            .map_err(|_| ())?;
-        let track = SearchMessage::search(
-            self.bots.get_bot_by_id(bot).ok_or(())?.http().clone(),
-            self.channel,
-            tracks,
-            user,
-            self.event_handler
-                .get_shard_sender(self.id, bot)
-                .await
-                .ok_or(())?,
-            self.scheduler.clone(),
-        )
-        .await
-        .map_err(|_| ())?;
-        self.player_manager
-            .request(PlayerRequest::Enqueue(track, voice_channel))
-            .await
-            .map_err(|_| ())
-    }
 }
 
-#[async_trait]
-impl GuildEventHandler for ReciprocityGuild {
-    async fn run(&self, event: Event) {
-        match event {
-            Event::NewMessage(message) => {
-                self.handle_new_message(message).await.ok();
-            }
-            Event::DeleteMessage(_, _) => {
-                todo!("Check if MainMessage was deleted")
-            }
-            Event::Resume(_, _) => {
-                todo!("Check if anything was missed")
-            }
-            Event::VoiceUpdate(old, _) => {
-                if let Some(voice_state) = old {
-                    if let Some(channel) = voice_state.channel_id {
-                        if !self.bots.user_in_channel(&channel, &self.id).await {
-                            self.player_manager.leave(channel).await.ok();
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 #[derive(Debug, Error)]
 pub enum ReciprocityGuildError {
     #[error("Guild was not found in config: {0:?}")]
@@ -150,8 +77,32 @@ pub enum ReciprocityGuildError {
 }
 
 #[async_trait]
-impl GuildLavalinkHandler for ReciprocityGuild {
-    async fn run(&self, event: LavalinkEvent) {
-        self.player_manager.handle_player_event(event).await.ok();
+impl GuildEventHandler for ReciprocityGuild {
+    async fn new_message(&self, message: Message) {
+        todo!()
+    }
+
+    async fn deleted_message(&self, channel: ChannelId, message: MessageId) {
+        todo!()
+    }
+
+    async fn resume(&self, time: Instant, event: ResumedEvent) {
+        todo!()
+    }
+
+    async fn voice_update(&self, old_voice_state: Option<VoiceState>, new_voice_state: VoiceState) {
+        todo!()
+    }
+
+    async fn lavalink(&self, event: LavalinkEvent, client: LavalinkClient) {
+        todo!()
+    }
+
+    async fn main_message_error(&self, error: MessageError) {
+        todo!()
+    }
+
+    async fn player_status_changed(&self) {
+        todo!()
     }
 }

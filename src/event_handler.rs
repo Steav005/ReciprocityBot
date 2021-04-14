@@ -1,3 +1,4 @@
+use crate::context::GuildEventHandler;
 use arraydeque::ArrayDeque;
 use log::{debug, error};
 use serenity::async_trait;
@@ -88,8 +89,8 @@ impl EventHandler {
     }
 
     async fn process(&self, guild: GuildId, event: Event) -> Result<(), EventHandlerError> {
-        match self.cache.read().await.get(&guild) {
-            None => Err(EventHandlerError::NoGuild(guild)),
+        let (event, handler) = match self.cache.read().await.get(&guild) {
+            None => return Err(EventHandlerError::NoGuild(guild)),
             Some((cache, handler)) => {
                 if event.is_cached() {
                     {
@@ -103,10 +104,16 @@ impl EventHandler {
                         cache.push_front(event.clone()).expect("Cache is full");
                     }
                 }
-                handler.run(event).await;
-                Ok(())
+                (event, handler.clone())
             }
+        };
+        match event {
+            Event::NewMessage(msg) => handler.new_message(msg).await,
+            Event::DeleteMessage(ch, msg) => handler.deleted_message(ch, msg).await,
+            Event::Resume(t, e) => handler.resume(t, e).await,
+            Event::VoiceUpdate(ov, nv) => handler.voice_update(ov, nv).await,
         }
+        Ok(())
     }
 
     fn handle_result(result: Result<(), EventHandlerError>) {
@@ -140,11 +147,6 @@ impl EventHandler {
             }
         }
     }
-}
-
-#[async_trait]
-pub trait GuildEventHandler: Send + Sync {
-    async fn run(&self, event: Event);
 }
 
 #[async_trait]
