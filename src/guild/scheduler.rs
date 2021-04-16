@@ -4,11 +4,9 @@ use std::iter::Iterator;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serenity::async_trait;
 use serenity::futures::stream::StreamExt;
 use serenity::model::prelude::{ChannelId, GuildId};
 
-use serenity::CacheAndHttp;
 use strum::IntoEnumIterator;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -19,7 +17,6 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::bots::BotMap;
-use crate::guild::ReciprocityGuild;
 use crate::task_handle::{Task, TaskHandle, TaskHandlerError, TaskRoute};
 
 #[derive(Clone)]
@@ -68,7 +65,7 @@ impl GuildScheduler {
 
     pub async fn process_enqueue(&self, task: impl Task + 'static) -> Result<(), SchedulerError> {
         let route = task.route();
-        let (handle, task_result) = TaskHandle::new(task);
+        let (handle, _) = TaskHandle::new(task);
 
         if let Some(scheduler) = self.route_scheduler.get(&route) {
             //Enqueue handle

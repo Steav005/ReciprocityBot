@@ -174,13 +174,13 @@ impl Task for AddMessageReactionTask {
 }
 
 #[derive(Debug)]
-pub struct SendDMTask {
+pub struct SendDmTask {
     channel: ChannelId,
     text: String,
 }
 
 #[async_trait]
-impl Task for SendDMTask {
+impl Task for SendDmTask {
     async fn run(&mut self, client: Arc<Http>) -> Result<(), SerenityError> {
         client
             .send_message(self.channel.0, &Value::String(self.text.clone()))

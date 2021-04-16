@@ -1,29 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serenity::async_trait;
 use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
-use serenity::{async_trait, CacheAndHttp};
-use songbird::Songbird;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock};
-
-use crate::task_handle::{DeleteMessageTask, TaskRoute};
 
 use crate::bots::BotMap;
 use crate::config::Config;
 use crate::context::{Context, GuildEventHandler};
-use crate::event_handler::{Event, EventHandler};
-use crate::guild::message_manager::{MessageError, SearchMessage};
-use crate::guild::player_manager::{PlayerManager, PlayerRequest};
+use crate::event_handler::EventHandler;
+use crate::guild::message_manager::MessageError;
+use crate::guild::player_manager::PlayerManager;
 use crate::guild::scheduler::GuildScheduler;
 use crate::lavalink_handler::LavalinkEvent;
-use crate::lavalink_supervisor::LavalinkSupervisor;
-use arc_swap::ArcSwap;
-use lavalink_rs::model::{PlayerUpdate, TrackFinish, TrackStart};
 use lavalink_rs::LavalinkClient;
 use serenity::model::event::ResumedEvent;
 use serenity::model::prelude::{Message, VoiceState};
-use std::ops::Not;
 use std::time::Instant;
 
 pub mod message_manager;
@@ -38,7 +30,7 @@ impl ReciprocityGuild {
         id: GuildId,
         bots: Arc<BotMap>,
         event_handler: EventHandler,
-        lavalink_supervisor: LavalinkSupervisor,
+        lavalink: Arc<HashMap<UserId, LavalinkClient>>,
         config: Arc<Config>,
     ) -> Result<ReciprocityGuild, ReciprocityGuildError> {
         let channel = config
@@ -50,9 +42,9 @@ impl ReciprocityGuild {
             .1;
 
         let scheduler = GuildScheduler::new(id, channel, bots.clone());
-        let player_manager = Arc::new(PlayerManager::new(id, bots.clone(), lavalink_supervisor));
+        let player_manager = Arc::new(PlayerManager::new(id, bots.clone(), lavalink));
 
-        let mut guild = ReciprocityGuild {
+        let guild = ReciprocityGuild {
             0: Context {
                 id,
                 channel,
@@ -78,31 +70,35 @@ pub enum ReciprocityGuildError {
 
 #[async_trait]
 impl GuildEventHandler for ReciprocityGuild {
-    async fn new_message(&self, message: Message) {
+    async fn new_message(&self, _message: Message) {
         todo!()
     }
 
-    async fn deleted_message(&self, channel: ChannelId, message: MessageId) {
+    async fn deleted_message(&self, _channel: ChannelId, _message: MessageId) {
         todo!()
     }
 
-    async fn resume(&self, time: Instant, event: ResumedEvent) {
+    async fn resume(&self, _time: Instant, _event: ResumedEvent) {
         todo!()
     }
 
-    async fn voice_update(&self, old_voice_state: Option<VoiceState>, new_voice_state: VoiceState) {
+    async fn voice_update(&self, _old_voice_state: Option<VoiceState>, _new_voice_state: VoiceState) {
         todo!()
     }
 
-    async fn lavalink(&self, event: LavalinkEvent, client: LavalinkClient) {
+    async fn lavalink(&self, _event: LavalinkEvent, _client: LavalinkClient) {
         todo!()
     }
 
-    async fn main_message_error(&self, error: MessageError) {
+    async fn main_message_error(&self, _error: MessageError) {
         todo!()
     }
 
     async fn player_status_changed(&self) {
+        todo!()
+    }
+
+    async fn main_message_emote_check(&self) {
         todo!()
     }
 }

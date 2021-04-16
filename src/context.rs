@@ -5,7 +5,6 @@ use crate::guild::message_manager::MessageError;
 use crate::guild::player_manager::PlayerManager;
 use crate::guild::scheduler::GuildScheduler;
 use crate::lavalink_handler::LavalinkEvent;
-use lavalink_rs::model::{PlayerUpdate, TrackFinish, TrackStart};
 use lavalink_rs::LavalinkClient;
 use serenity::async_trait;
 use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ResumedEvent, VoiceState};
@@ -40,5 +39,7 @@ pub trait GuildEventHandler: Send + Sync {
     // Reciprocity Events
     async fn main_message_error(&self, error: MessageError);
 
-    async fn player_status_changed(&self, );
+    async fn player_status_changed(&self);
+
+    async fn main_message_emote_check(&self);
 }

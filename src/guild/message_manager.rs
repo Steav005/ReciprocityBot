@@ -1,37 +1,25 @@
-use crate::bots::{Bot, BotMap};
-use crate::event_handler::EventHandler;
-use crate::guild::player_manager::{PlayerManager, PlayerRequest, PlayerStates};
+use crate::bots::Bot;
+use crate::context::Context;
 use crate::guild::scheduler::GuildScheduler;
-use crate::player::PlayerState;
-use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
-use futures::future::{BoxFuture, Either, Select, SelectAll};
+use crate::guild::ReciprocityGuild;
+use crate::task_handle::{AddMessageReactionTask, DeleteMessageTask};
 use futures::FutureExt;
-use futures::StreamExt;
-use lavalink_rs::model::{Play, Track};
+use lavalink_rs::model::Track;
 use serde_json::Value;
 use serenity::client::bridge::gateway::ShardMessenger;
-use serenity::collector::{ReactionAction, ReactionCollector};
 use serenity::http::Http;
-use serenity::model::guild::Member;
-use serenity::model::guild::Target::Emoji;
 use serenity::model::prelude::{
-    ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId, VoiceState,
+    ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId,
 };
-use serenity::model::Permissions;
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
-use std::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use std::convert::TryFrom;
-use std::future::Future;
-use std::iter::Map;
 use std::ops::{Deref, Index};
-use std::pin::Pin;
-use std::slice::IterMut;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::watch::error::RecvError;
-use tokio::sync::watch::{Receiver as WatchReceiver, Receiver};
+use tokio::sync::Mutex;
 
 const DELETE_MESSAGE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -59,14 +47,13 @@ pub struct SearchMessage;
 impl SearchMessage {
     pub async fn search(
         bot: Arc<Http>,
-        channel: ChannelId,
         tracks: Vec<Track>,
         requester: UserId,
         shard_messenger: impl AsRef<ShardMessenger>,
-        scheduler: GuildScheduler,
+        context: Context,
     ) -> Result<Track, MessageError> {
         let message = bot
-            .send_message(channel.0, &Self::content(&tracks))
+            .send_message(context.channel.0, &Self::content(&tracks))
             .await
             .map_err(MessageError::SerenityError)?;
 
@@ -100,15 +87,16 @@ impl SearchMessage {
             });
         tokio::spawn(add_emotes(
             message.id,
-            channel,
+            context.channel,
             emotes_1.clone(),
-            scheduler.clone(),
+            context.scheduler.clone(),
         ));
         let track: Result<Track, MessageError> = collector.await.ok_or(MessageError::Timeout());
 
-        scheduler
+        context
+            .scheduler
             .process_enqueue(DeleteMessageTask {
-                channel,
+                channel: context.channel,
                 message: message.id,
             })
             .await
@@ -145,17 +133,48 @@ impl SearchMessage {
 
 #[derive(Clone)]
 pub struct MainMessage {
-    guild: GuildId,
-    channel: ChannelId,
-    bots: Arc<BotMap>,
+    lock: Arc<Mutex<()>>,
+    message: Message,
     bot: Arc<Bot>,
     shard: ShardMessenger,
-    player_manager: PlayerManager,
-    event_handler: EventHandler,
-    scheduler: GuildScheduler,
+    context: Context,
 }
 
-impl MainMessage {}
+impl MainMessage {
+    pub async fn new(guild: ReciprocityGuild, context: Context) -> Result<Self, MessageError> {
+        let bot = context
+            .bots
+            .get_any_guild_bot(&context.id)
+            .await
+            .ok_or(MessageError::NoBot(context.id))?;
+        let shard = context
+            .event_handler
+            .get_shard_sender(context.id, bot.id())
+            .await
+            .ok_or_else(|| MessageError::NoShard(bot.id()))?;
+
+        let message = bot
+            .http()
+            .send_message(context.channel.0, &Self::content())
+            .await
+            .map_err(MessageError::SerenityError)?;
+        let main_message = MainMessage {
+            lock: Arc::new(Mutex::new(())),
+            message,
+            bot,
+            shard,
+            context,
+        };
+        tokio::spawn(main_message.clone().run(guild));
+        Ok(main_message)
+    }
+
+    pub async fn run(self, _guild: ReciprocityGuild) {}
+
+    pub fn content() -> Value {
+        todo!()
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum MessageError {

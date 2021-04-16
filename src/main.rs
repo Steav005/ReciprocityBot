@@ -1,13 +1,12 @@
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::Future;
-use serenity::http::Http;
 use serenity::model::id::{GuildId, UserId};
-use serenity::prelude::{SerenityError, TypeMapKey};
-use serenity::{CacheAndHttp, Client};
-use songbird::{SerenityInit, Songbird, SongbirdKey};
+use serenity::prelude::SerenityError;
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
 
@@ -16,7 +15,8 @@ use crate::config::Config;
 use crate::event_handler::EventHandler;
 use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
 use crate::lavalink_handler::LavalinkHandler;
-use crate::lavalink_supervisor::LavalinkSupervisor;
+use lavalink_rs::error::LavalinkError;
+use lavalink_rs::LavalinkClient;
 
 mod bots;
 mod config;
@@ -24,7 +24,6 @@ mod context;
 mod event_handler;
 mod guild;
 mod lavalink_handler;
-mod lavalink_supervisor;
 mod multi_key_map;
 pub mod player;
 pub mod task_handle;
@@ -48,9 +47,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             //Build LavalinkEventHandler and LavalinkSupervisor using the EventHandler
             let lavalink_event_handler = LavalinkHandler::new();
-            let lavalink_supervisor =
-                LavalinkSupervisor::new(bots.ids(), lavalink_event_handler.clone(), config.clone())
-                    .await;
+            let mut lavalink: HashMap<UserId, LavalinkClient> = HashMap::new();
+            for bot in bots.ids() {
+                let client = LavalinkClient::builder(bot)
+                    .set_host(&config.lavalink.address)
+                    .set_password(&config.lavalink.password)
+                    .set_is_ssl(true)
+                    .build(lavalink_event_handler.clone())
+                    .await
+                    .map_err(ReciprocityError::Lavalink)?;
+                lavalink.insert(bot, client);
+            }
+            let lavalink = Arc::new(lavalink);
 
             //Build every Guild
             for guild in config.guilds.values() {
@@ -60,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     id,
                     bots.clone(),
                     event_handler.clone(),
-                    lavalink_supervisor.clone(),
+                    lavalink.clone(),
                     config.clone(),
                 )
                 .map_err(|e| ReciprocityError::Guild(e, id))?;
@@ -95,6 +103,8 @@ enum ReciprocityError {
     JoinErrorClient(JoinError),
     #[error("Error creating Bots: {0:?}")]
     BotCreateError(BotError),
+    #[error("Lavalink Error occured: {0:?}")]
+    Lavalink(LavalinkError),
 }
 
 ///Builds and starts bots from token and with EventHandler

@@ -12,7 +12,6 @@ use songbird::error::JoinError;
 use songbird::Songbird;
 use thiserror::Error;
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
-use tokio::sync::Notify;
 
 const MUSIC_QUEUE_LIMIT: usize = 100;
 
@@ -108,7 +107,6 @@ impl Player {
     }
 
     pub async fn skip(&mut self) -> Result<(), PlayerError> {
-        let mut return_state = None;
         //If loop is one, move the current track to history, so a new Track gets played
         if let Playback::OneLoop = self.player_state.playback {
             if let Some((_, track)) = self.player_state.current.take() {
@@ -123,7 +121,6 @@ impl Player {
                     .push_front(track)
                     .expect("History is full");
                 self.send.send(Arc::new(self.player_state.clone())).ok();
-                return_state = Some(self.player_state.clone());
             }
         }
 
@@ -164,10 +161,8 @@ impl Player {
             changed = true;
         }
 
-        let mut return_state = None;
         if changed {
             self.send.send(Arc::new(self.player_state.clone())).ok();
-            return_state = Some(self.player_state.clone())
         }
         self.lavalink
             .stop(self.guild)

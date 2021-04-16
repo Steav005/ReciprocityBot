@@ -1,28 +1,20 @@
 use crate::bots::BotMap;
-use crate::guild::message_manager::EmoteAction;
-use crate::guild::ReciprocityGuild;
 use crate::lavalink_handler::LavalinkEvent;
-use crate::lavalink_supervisor::LavalinkSupervisor;
 use crate::multi_key_map::{HashArc, TripleHashMap};
 use crate::player::{Playback, Player, PlayerError, PlayerState};
-use arc_swap::ArcSwap;
 use lavalink_rs::model::Track;
 use lavalink_rs::{LavalinkClient, LavalinkClientInner};
 use log::error;
 use rand::prelude::SliceRandom;
-use serenity::async_trait;
 use serenity::model::prelude::{ChannelId, GuildId, UserId};
 use std::borrow::BorrowMut;
-use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::oneshot::error::RecvError;
-use tokio::sync::watch::{Receiver as WatchReceiver, Receiver, Sender as WatchSender};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::watch::Receiver as WatchReceiver;
+use tokio::sync::{Mutex, RwLock};
 
 pub type PlayerStates = Vec<WatchReceiver<Arc<PlayerState>>>;
 pub type PlayerMapType = TripleHashMap<
@@ -38,11 +30,15 @@ pub struct PlayerManager {
     bots: Arc<BotMap>,
     player_states: Arc<RwLock<PlayerStates>>,
     player: Arc<RwLock<PlayerMapType>>,
-    supervisor: LavalinkSupervisor,
+    lavalink: Arc<HashMap<UserId, LavalinkClient>>,
 }
 
 impl PlayerManager {
-    pub fn new(guild: GuildId, bots: Arc<BotMap>, supervisor: LavalinkSupervisor) -> Self {
+    pub fn new(
+        guild: GuildId,
+        bots: Arc<BotMap>,
+        lavalink: Arc<HashMap<UserId, LavalinkClient>>,
+    ) -> Self {
         let mut player = TripleHashMap::new();
         for bot in bots.ids() {
             player.insert(bot, Arc::new(RwLock::new(None)))
@@ -54,7 +50,7 @@ impl PlayerManager {
             guild,
             bots,
             player,
-            supervisor,
+            lavalink,
             player_states,
         }
     }
@@ -66,16 +62,15 @@ impl PlayerManager {
             .await
             .get_k2(&request.get_channel())
             .map(|(bot, player)| (*bot, player.clone()));
-        let (bot, player) =
+        let (_, player) =
             player.ok_or_else(|| PlayerMapError::NoPlayerFound(request.get_channel()))?;
         let mut player_lock = player.write().await;
-        let mut player = player_lock
+        let player = player_lock
             .deref_mut()
             .as_mut()
             .ok_or_else(|| PlayerMapError::NoPlayerFound(request.get_channel()))?;
-        let lavalink = player.get_lavalink();
 
-        let result = match request {
+        match request {
             PlayerRequest::Skip(_) => player.skip().await.map_err(PlayerMapError::PlayerError),
             PlayerRequest::BackSkip(_) => player
                 .back_skip()
@@ -97,11 +92,6 @@ impl PlayerManager {
                 .enqueue(track)
                 .await
                 .map_err(PlayerMapError::PlayerError),
-        };
-        drop(player_lock);
-        match result {
-            Err(e) => Err(self.handle_error(e, bot, lavalink).await),
-            Ok(_) => Ok(()),
         }
     }
 
@@ -123,41 +113,14 @@ impl PlayerManager {
             .as_ref()
             .ok_or(PlayerMapError::NoPlayerFound(channel))?;
         player.search(query, |res| async { if send.send(res).is_ok() {} });
-        let lavalink = player.get_lavalink();
         drop(player_lock);
 
         match rev.await {
-            Ok(res) => {
-                let res = res
-                    .map_err(PlayerMapError::PlayerError)
-                    .map(|tracks| (bot, tracks));
-                match res {
-                    Err(e) => Err(self.handle_error(e, bot, lavalink).await),
-                    Ok(vec) => Ok(vec),
-                }
-            }
+            Ok(res) => res
+                .map_err(PlayerMapError::PlayerError)
+                .map(|tracks| (bot, tracks)),
             Err(rec_err) => Err(PlayerMapError::SearchSenderDropped(rec_err)),
         }
-    }
-
-    async fn handle_error(
-        &self,
-        error: PlayerMapError,
-        bot: UserId,
-        lavalink: LavalinkClient,
-    ) -> PlayerMapError {
-        if let PlayerMapError::PlayerError(player_error) = &error {
-            if player_error.is_fatal() {
-                if let Some(player) = self.player.read().await.get(&bot).cloned() {
-                    if let Some(player) = player.write().await.take() {
-                        player.disconnect().await.ok();
-                        self.player.write().await.sub_k1_k2(&bot);
-                    }
-                };
-                self.supervisor.request_new(bot, lavalink).await;
-            }
-        }
-        error
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
@@ -187,7 +150,7 @@ impl PlayerManager {
         let player = map_lock
             .get(&bot)
             .cloned()
-            .ok_or(PlayerMapError::NoBotWithID(bot, self.guild))?;
+            .ok_or(PlayerMapError::NoBotWithId(bot, self.guild))?;
         let mut lock = player.write().await;
         if lock.is_some() {
             return Err(PlayerMapError::PlayerAlreadyExists(bot));
@@ -195,16 +158,16 @@ impl PlayerManager {
         let (cache, songbird) = self
             .bots
             .get_bot_cache_songbird(&bot)
-            .ok_or(PlayerMapError::NoBotWithID(bot, self.guild))?;
+            .ok_or(PlayerMapError::NoBotWithId(bot, self.guild))?;
         cache
             .guild_field(self.guild, |_| ())
             .await
-            .ok_or(PlayerMapError::NoBotWithID(bot, self.guild))?;
+            .ok_or(PlayerMapError::NoBotWithId(bot, self.guild))?;
         let lavalink = self
-            .supervisor
-            .request_current(bot)
-            .await
-            .ok_or(PlayerMapError::NoLavalink(bot))?;
+            .lavalink
+            .get(&bot)
+            .ok_or(PlayerMapError::NoLavalink(bot))?
+            .clone();
         let result = Player::new(bot, channel, self.guild, songbird, lavalink.clone())
             .await
             .map_err(PlayerMapError::PlayerError);
@@ -213,8 +176,8 @@ impl PlayerManager {
             Err(e) => {
                 drop(map_lock);
                 drop(lock);
-                return Err(self.handle_error(e, bot, lavalink).await);
-            },
+                return Err(e);
+            }
             Ok((player, rec)) => (player, rec),
         };
 
@@ -261,18 +224,19 @@ impl PlayerManager {
         &self,
         event: LavalinkEvent,
         client: LavalinkClient,
-    ) -> Result<(), ()> {
+    ) -> Result<(), PlayerMapError> {
         let (bot, player) = self
             .player
             .read()
             .await
-            .get_k1(&HashArc::from(client.inner))
+            .get_k1(&HashArc::from(client.inner.clone()))
             .map(|(bot, player)| (*bot, player.clone()))
-            .ok_or(())?;
+            .ok_or(PlayerMapError::NoLavalinkKey())?;
         let mut player_lock = player.write().await;
-        let player = player_lock.as_mut().ok_or(())?;
-        let lavalink = player.get_lavalink();
-        let result = match event {
+        let player = player_lock
+            .as_mut()
+            .ok_or(PlayerMapError::NoPlayerForBot(bot))?;
+        match event {
             LavalinkEvent::Update(update) => {
                 player.update(update);
                 Ok(())
@@ -285,13 +249,6 @@ impl PlayerManager {
                 .track_end(finish)
                 .await
                 .map_err(PlayerMapError::PlayerError),
-        };
-
-        if let Err(e) = result {
-            self.handle_error(e, bot, lavalink).await;
-            Err(())
-        } else {
-            Ok(())
         }
     }
 }
@@ -326,6 +283,8 @@ impl PlayerRequest {
 pub enum PlayerMapError {
     #[error("Could not find Player for: {0:?}")]
     NoPlayerFound(ChannelId),
+    #[error("Player was None for: {0:?}")]
+    NoPlayerForBot(UserId),
     #[error("Search Sender was dropped: {0:?}")]
     SearchSenderDropped(RecvError),
     #[error("Player Error occurred: {0:?}")]
@@ -333,7 +292,9 @@ pub enum PlayerMapError {
     #[error("No free Bot available")]
     NoFreeBot(),
     #[error("Could not find Bot for ID: {0:?} in Guild: {1:?}")]
-    NoBotWithID(UserId, GuildId),
+    NoBotWithId(UserId, GuildId),
+    #[error("Could not find Lavalink Client in Map")]
+    NoLavalinkKey(),
     #[error("Player already exists for Bot with ID: {0:?}")]
     PlayerAlreadyExists(UserId),
     #[error("No Lavalink for Bot with ID: {0:?}")]

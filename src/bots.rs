@@ -6,7 +6,6 @@ use serenity::prelude::SerenityError;
 use serenity::{CacheAndHttp, Client};
 use songbird::{SerenityInit, Songbird, SongbirdKey};
 use std::ops::{Deref, Not};
-use std::slice::Iter;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::task::JoinHandle;
