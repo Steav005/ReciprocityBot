@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[derive(Debug)]
 pub enum LavalinkEvent {
     Update(PlayerUpdate),
     Start(TrackStart),
@@ -34,7 +35,7 @@ impl LavalinkHandler {
 #[async_trait]
 impl LavalinkEventHandler for LavalinkHandler {
     async fn stats(&self, _: LavalinkClient, _: Stats) {
-        todo!()
+        //TODO maybe handle
     }
 
     async fn player_update(&self, client: LavalinkClient, event: PlayerUpdate) {

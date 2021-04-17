@@ -9,6 +9,8 @@ edition = "2018"
 [dependencies]
 arrayvec = "^0"
 log = "^0"
+tracing = "^0"
+tracing-subscriber = "^0"
 futures = "^0"
 arc-swap = "^1"
 anyhow = "^1"

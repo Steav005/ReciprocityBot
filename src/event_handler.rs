@@ -1,6 +1,6 @@
 use crate::context::GuildEventHandler;
 use arraydeque::ArrayDeque;
-use log::{debug, error};
+use log::{debug, error, info};
 use serenity::async_trait;
 use serenity::client::bridge::gateway::ShardMessenger;
 use serenity::client::EventHandler as SerenityEventHandler;
@@ -33,7 +33,7 @@ pub enum EventHandlerError {
     NoGuild(GuildId),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Event {
     NewMessage(Message),
     DeleteMessage(ChannelId, MessageId),
@@ -77,6 +77,7 @@ impl EventHandler {
     }
 
     pub async fn add_guild(&self, guild: GuildId, event_handler: Arc<dyn GuildEventHandler>) {
+        info!("Adding Guild to Event Handler: {:?}", guild);
         let cache = Arc::new(Mutex::new(ArrayDeque::new()));
         self.cache
             .write()
@@ -107,6 +108,7 @@ impl EventHandler {
                 (event, handler.clone())
             }
         };
+        info!("Got new Event: {:?}", &event);
         match event {
             Event::NewMessage(msg) => handler.new_message(msg).await,
             Event::DeleteMessage(ch, msg) => handler.deleted_message(ch, msg).await,
@@ -131,20 +133,22 @@ impl EventHandler {
         None
     }
 
-    async fn replace_shard_sender(&self, ctx: Context, guild: GuildId) {
-        if let Some(guild) = self.shard_sender.read().await.get(&guild) {
+    async fn replace_shard_sender(&self, ctx: Context, guild_id: GuildId) {
+        if let Some(guild) = self.shard_sender.read().await.get(&guild_id) {
             let bot_id = ctx.cache.current_user_id().await;
             let read_lock = guild.read().await;
             if let Some((id, _)) = read_lock.get(&bot_id) {
                 let id = *id;
-                drop(read_lock);
-                if id != ctx.shard_id {
-                    guild
-                        .write()
-                        .await
-                        .insert(bot_id, (ctx.shard_id, ctx.shard));
+                if id == ctx.shard_id {
+                    return;
                 }
             }
+            drop(read_lock);
+            info!("Got new Shard: {:?}, {:?}", ctx.shard_id, guild_id);
+            guild
+                .write()
+                .await
+                .insert(bot_id, (ctx.shard_id, ctx.shard));
         }
     }
 }

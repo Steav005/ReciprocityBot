@@ -55,6 +55,10 @@ impl PlayerManager {
         }
     }
 
+    pub async fn bot_in_channel(&self, channel: &ChannelId) -> bool {
+        self.player.read().await.contains_k2(channel)
+    }
+
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
         let player = self
             .player
@@ -185,7 +189,6 @@ impl PlayerManager {
         let mut states = self.player_states.write().await;
         states.push(rec);
         map_lock.add_k1_k2(bot, HashArc::from(lavalink.inner), channel);
-
         Ok(())
     }
 

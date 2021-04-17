@@ -1,6 +1,6 @@
 use std::borrow::BorrowMut;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use arraydeque::{ArrayDeque, CapacityError};
 use futures::Future;
@@ -276,8 +276,9 @@ impl Player {
             }
             //Reset Duration of Current
             Playback::OneLoop => {
-                if let Some((duration, _)) = self.player_state.current.borrow_mut() {
+                if let Some(((duration, instant), _)) = self.player_state.current.borrow_mut() {
                     *duration = Duration::from_secs(0);
+                    *instant = Instant::now();
                 }
             }
         }
@@ -285,7 +286,7 @@ impl Player {
         //If current is None: Pull new one from Playlist
         if self.player_state.current.is_none() {
             if let Some(track) = self.player_state.playlist.pop_front() {
-                self.player_state.current = Some((Duration::from_secs(0), track));
+                self.player_state.current = Some(((Duration::from_secs(0), Instant::now()), track));
                 self.player_state.play_state = PlayState::Play;
                 changed = true;
             }
@@ -295,8 +296,8 @@ impl Player {
             self.send.send(Arc::new(self.player_state.clone())).ok();
         }
 
-        //Start if Current is some. Stop is Current is none.
-        match self.player_state.current.take() {
+        //Start if Current is some. Stop if Current is none.
+        match &self.player_state.current {
             None => self
                 .lavalink
                 .stop(self.guild)
@@ -304,7 +305,7 @@ impl Player {
                 .map_err(PlayerError::Lavalink),
             Some((_, track)) => self
                 .lavalink
-                .play(self.guild, track)
+                .play(self.guild, track.clone())
                 .start()
                 .await
                 .map_err(PlayerError::Lavalink),
@@ -312,20 +313,12 @@ impl Player {
     }
 
     pub fn update(&mut self, update: PlayerUpdate) {
-        let update_time = Duration::from_secs(update.state.time as u64);
-        let now = Duration::from_secs(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("SystemTime before UNIX")
-                .as_secs(),
-        );
-        let elapsed = now - update_time;
-        let new_pos = Duration::from_millis(update.state.position as u64) + elapsed;
-
-        if let Some((pos, _)) = self.player_state.current.borrow_mut() {
+        let now = Instant::now();
+        let new_pos = Duration::from_millis(update.state.position as u64);
+        if let Some(((pos, when), _)) = self.player_state.current.borrow_mut() {
             if pos.as_secs() != new_pos.as_secs() {
                 *pos = new_pos;
-
+                *when = now;
                 self.send.send(Arc::new(self.player_state.clone())).ok();
             }
         }
@@ -388,7 +381,7 @@ impl PlayerError {
 #[derive(Clone, Debug)]
 pub struct PlayerState {
     pub bot: UserId,
-    pub current: Option<(Duration, Track)>,
+    pub current: Option<((Duration, Instant), Track)>,
     pub playlist: ArrayDeque<[Track; MUSIC_QUEUE_LIMIT]>,
     pub history: ArrayDeque<[Track; MUSIC_QUEUE_LIMIT]>,
     pub play_state: PlayState,

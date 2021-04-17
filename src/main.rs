@@ -31,6 +31,10 @@ pub mod task_handle;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     //TODO maybe use env for file name
     //Get Config
+
+    std::env::set_var("RUST_LOG", "info,reciprocity_bot=debug");
+    tracing_subscriber::fmt::init();
+
     let file_name: String = String::from("example_config.yml");
     let config = Arc::new(Config::new(file_name)?);
 
@@ -52,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let client = LavalinkClient::builder(bot)
                     .set_host(&config.lavalink.address)
                     .set_password(&config.lavalink.password)
-                    .set_is_ssl(true)
+                    //.set_is_ssl(true)
                     .build(lavalink_event_handler.clone())
                     .await
                     .map_err(ReciprocityError::Lavalink)?;

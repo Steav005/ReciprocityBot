@@ -41,9 +41,5 @@ pub trait GuildEventHandler: Send + Sync {
     // Reciprocity Events
     async fn main_message_error(&self, error: MessageError);
 
-    async fn player_status_changed(&self);
-
-    async fn main_message_emote_check(&self);
-
     async fn main_message_event(&self, event: EmoteAction, user: UserId);
 }

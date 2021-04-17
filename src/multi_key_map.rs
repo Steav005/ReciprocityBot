@@ -47,6 +47,18 @@ where
             .and_then(|k| self.map.get(k).map(|(_, v)| (k, v)))
     }
 
+    pub fn contains_key(&self, key: &KM) -> bool {
+        self.map.contains_key(key)
+    }
+
+    pub fn contains_k1(&self, key: &K1) -> bool {
+        self.map_one.contains_key(key)
+    }
+
+    pub fn contains_k2(&self, key: &K2) -> bool {
+        self.map_two.contains_key(key)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&KM, &V)> {
         self.map.iter().map(|(k, (_, v))| (k, v))
     }
@@ -55,14 +67,15 @@ where
         self.map.insert(k, (None, v));
     }
 
-    pub fn add_k1_k2(&mut self, k: KM, k1: K1, k2: K2) {
-        if let Some((Some((one, two)), _)) = self.map.get_mut(&k) {
-            *one = k1.clone();
-            *two = k2.clone();
+    pub fn add_k1_k2(&mut self, k: KM, k1: K1, k2: K2) -> bool {
+        if let Some((keys, _)) = self.map.get_mut(&k) {
+            *keys = Some((k1.clone(), k2.clone()));
 
             self.map_one.insert(k1, k.clone());
             self.map_two.insert(k2, k);
+            return true;
         }
+        false
     }
 
     pub fn sub_k1_k2(&mut self, k: &KM) {
