@@ -1,12 +1,13 @@
 use crate::bots::Bot;
-use crate::context::Context;
+use crate::context::{Context, GuildEventHandler};
 use crate::guild::scheduler::GuildScheduler;
 use crate::guild::ReciprocityGuild;
-use crate::task_handle::{AddMessageReactionTask, DeleteMessageTask};
+use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
 use futures::FutureExt;
 use lavalink_rs::model::Track;
 use serde_json::Value;
 use serenity::client::bridge::gateway::ShardMessenger;
+use serenity::collector::ReactionAction;
 use serenity::http::Http;
 use serenity::model::prelude::{
     ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId,
@@ -14,16 +15,20 @@ use serenity::model::prelude::{
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
 use std::borrow::Borrow;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::ops::{Deref, Index};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
+use std::fmt::Write;
+use std::convert::AsRef;
 
 const DELETE_MESSAGE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_TITLE_LIMIT: usize = 40;
+const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 ///Adds a list of emotes to a message
 async fn add_emotes(
@@ -155,7 +160,7 @@ impl MainMessage {
 
         let message = bot
             .http()
-            .send_message(context.channel.0, &Self::content())
+            .send_message(context.channel.0, &Self::content(&context).await)
             .await
             .map_err(MessageError::SerenityError)?;
         let main_message = MainMessage {
@@ -165,14 +170,126 @@ impl MainMessage {
             shard,
             context,
         };
+        tokio::spawn(main_message.clone().update());
         tokio::spawn(main_message.clone().run(guild));
         Ok(main_message)
     }
 
-    pub async fn run(self, _guild: ReciprocityGuild) {}
+    pub async fn run(self, guild: ReciprocityGuild) {
+        let cloned_guild = guild.clone();
+        tokio::spawn(async move { cloned_guild.main_message_emote_check().await });
 
-    pub fn content() -> Value {
-        todo!()
+        let mut collector = self
+            .message
+            .await_reactions(&self.shard)
+            .added(true)
+            .removed(true)
+            .await;
+
+        while let Some(reaction) = collector.next().await {
+            match reaction.deref() {
+                ReactionAction::Added(reaction) => {
+                    if let Some(user) = &reaction.user_id {
+                        if self.context.bots.contains_id(user) {
+                            continue;
+                        }
+                        // Pass on Event to Guild
+                        if let Ok(emote_action) = reaction.deref().try_into() {
+                            let cloned_user = *user;
+                            let cloned_guild = guild.clone();
+                            tokio::spawn(async move {
+                                cloned_guild
+                                    .main_message_event(emote_action, cloned_user)
+                                    .await
+                            });
+                        }
+
+                        // Delete Reaction
+                        self.context
+                            .scheduler
+                            .process_enqueue(DeleteMessageReactionTask {
+                                channel: reaction.channel_id,
+                                message: reaction.message_id,
+                                user: *user,
+                                reaction: reaction.emoji.clone(),
+                            })
+                            .await
+                            .ok();
+                    } else {
+                        // Check Message
+                        let cloned_guild = guild.clone();
+                        tokio::spawn(async move { cloned_guild.main_message_emote_check().await });
+                    }
+                }
+                ReactionAction::Removed(reaction) => {
+                    if let Some(user) = &reaction.user_id {
+                        if !self.context.bots.contains_id(user) {
+                            continue;
+                        }
+                    }
+                    // Check Message
+                    let cloned_guild = guild.clone();
+                    tokio::spawn(async move { cloned_guild.main_message_emote_check().await });
+                }
+            }
+        }
+
+        guild
+            .main_message_error(MessageError::UnexpectedEnd())
+            .await
+    }
+
+    async fn update(self) {
+        let mut message = self.message;
+        loop {
+            tokio::time::sleep(MESSAGE_UPDATE_INTERVAL).await;
+            let content = Self::content(&self.context).await;
+            if message.content.eq(content.as_str().unwrap()) {
+                continue;
+            }
+            let edit_res = message
+                .edit(self.bot.cache_http(), |msg| msg.content(content))
+                .await;
+            if edit_res.is_err() {
+                //BREAK Update Loop if error occurred
+                return;
+            }
+        }
+    }
+
+    fn duration_fmt(dur: &'_ Duration) -> String{
+        let seconds = dur.as_secs() % 60;
+        let minutes = (dur.as_secs() / 60) % 60;
+        let hours = (dur.as_secs() / 60) / 60;
+        let mut msg = String::from("");
+        if hours > 0{
+            write!(msg, "{:02}:", hours).unwrap();
+        }
+        write!(msg, "{:02}:{:02}", minutes, seconds).unwrap();
+        msg
+    }
+
+    async fn content(context: &Context) -> Value {
+        let mut msg: String = "```css\r\n".to_string();
+        let states = context.player_manager.get_all_player_states().await;
+
+        for state in states.iter().map(|s| s.borrow().clone()){
+            if let Some(bot) = context.bots.get_bot_by_id(state.bot){
+                if let Some(bot) = bot.cache().member(context.id, state.bot).await{
+                    write!(msg, "[{}] {}\r\n", bot.nick.unwrap_or(bot.user.name), state.play_state.as_ref()).unwrap();
+                    if let Some((dur, cur)) = &state.current{
+                        write!(msg, "[CURRENT] {:.*} [{}]\r\n", SEARCH_TITLE_LIMIT, cur.track, Self::duration_fmt(dur)).unwrap();
+                    }
+                    for (i, track) in state.playlist.iter().enumerate().take(2){
+                        write!(msg, "[{}] {:.*}\r\n", i - 1, SEARCH_TITLE_LIMIT, track.track).unwrap();
+                    }
+                    write!(msg, "\r\n").unwrap();
+                }
+            }
+        }
+
+        write!(msg, "```").unwrap();
+        serde_json::Value::String(msg)
     }
 }
 

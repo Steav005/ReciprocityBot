@@ -9,7 +9,7 @@ use crate::bots::BotMap;
 use crate::config::Config;
 use crate::context::{Context, GuildEventHandler};
 use crate::event_handler::EventHandler;
-use crate::guild::message_manager::MessageError;
+use crate::guild::message_manager::{EmoteAction, MessageError};
 use crate::guild::player_manager::PlayerManager;
 use crate::guild::scheduler::GuildScheduler;
 use crate::lavalink_handler::LavalinkEvent;
@@ -82,7 +82,11 @@ impl GuildEventHandler for ReciprocityGuild {
         todo!()
     }
 
-    async fn voice_update(&self, _old_voice_state: Option<VoiceState>, _new_voice_state: VoiceState) {
+    async fn voice_update(
+        &self,
+        _old_voice_state: Option<VoiceState>,
+        _new_voice_state: VoiceState,
+    ) {
         todo!()
     }
 
@@ -99,6 +103,10 @@ impl GuildEventHandler for ReciprocityGuild {
     }
 
     async fn main_message_emote_check(&self) {
+        todo!()
+    }
+
+    async fn main_message_event(&self, _event: EmoteAction, _user: UserId) {
         todo!()
     }
 }

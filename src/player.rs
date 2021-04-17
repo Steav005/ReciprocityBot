@@ -13,6 +13,8 @@ use songbird::Songbird;
 use thiserror::Error;
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 
+use strum_macros::AsRefStr;
+
 const MUSIC_QUEUE_LIMIT: usize = 100;
 
 pub struct Player {
@@ -338,7 +340,7 @@ impl Player {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, AsRefStr)]
 pub enum PlayState {
     Play,
     Pause,
