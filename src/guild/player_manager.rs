@@ -4,7 +4,7 @@ use crate::multi_key_map::{HashArc, TripleHashMap};
 use crate::player::{Playback, Player, PlayerError, PlayerState};
 use lavalink_rs::model::Track;
 use lavalink_rs::{LavalinkClient, LavalinkClientInner};
-use log::error;
+use log::{error, info, warn};
 use rand::prelude::SliceRandom;
 use serenity::model::prelude::{ChannelId, GuildId, UserId};
 use std::borrow::BorrowMut;
@@ -60,6 +60,10 @@ impl PlayerManager {
     }
 
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
+        info!(
+            "Handling Player Request. Guild: {:?}, Request: {:?}",
+            self.guild, request
+        );
         let player = self
             .player
             .read()
@@ -128,6 +132,10 @@ impl PlayerManager {
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
+        info!(
+            "Handling Join Request. Guild: {:?}, channel: {:?}",
+            self.guild, channel
+        );
         let mut bot_vec = self
             .player
             .read()
@@ -140,12 +148,20 @@ impl PlayerManager {
         for (bot, player) in bot_vec {
             if player.read().await.is_none() {
                 let result = self.add_player(bot, channel).await;
-                if result.is_ok() {
-                    return result;
+                match &result {
+                    Ok(_) => return result,
+                    Err(e) => warn!(
+                        "Join Attempt Failed. Guild: {:?}, Channel: {:?}, Error: {:?}",
+                        self.guild, channel, e
+                    ),
                 }
             }
         }
 
+        info!(
+            "Failed Join Request. Guild: {:?}, channel: {:?}",
+            self.guild, channel
+        );
         Err(PlayerMapError::NoFreeBot())
     }
 
@@ -193,6 +209,10 @@ impl PlayerManager {
     }
 
     pub async fn leave(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
+        info!(
+            "Attempt Voice Channel Leave. Guild: {:?}, Channel: {:?}",
+            self.guild, channel
+        );
         //Get bot and player while removing channel and lavalink form the HashMap
         let (bot, player) = {
             let mut lock = self.player.write().await;
@@ -205,12 +225,18 @@ impl PlayerManager {
         };
 
         let mut player_lock = player.write().await;
-        player_lock
+        let disconnect_res = player_lock
             .take()
             .ok_or(PlayerMapError::NoPlayerFound(channel))?
             .disconnect()
-            .await
-            .ok();
+            .await;
+        if let Err(e) = disconnect_res {
+            warn!(
+                "Error processing player disconnect. Guild: {:?}, Channel: {:?}, Error: {:?}",
+                self.guild, channel, e
+            );
+        }
+
         let mut states = self.player_states.write().await;
         *states = states
             .drain(..)
@@ -256,6 +282,7 @@ impl PlayerManager {
     }
 }
 
+#[derive(Debug)]
 pub enum PlayerRequest {
     //Join(ChannelId),
     //Leave(ChannelId),

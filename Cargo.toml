@@ -25,8 +25,9 @@ strum = "^0"
 strum_macros = "^0"
 tokio-stream = "^0"
 rand = "^0"
+clap = "^2"
 
 tokio = { version = "^1", features = ["rt-multi-thread", "time", "sync", "net"] }
 serenity = { version = "^0", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
 songbird = { version = "^0", default-features = false, features = ["serenity-rustls", "gateway"]}
-lavalink-rs = {git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}
+lavalink-rs = { git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}

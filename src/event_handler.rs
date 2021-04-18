@@ -38,15 +38,16 @@ pub enum Event {
     NewMessage(Message),
     DeleteMessage(ChannelId, MessageId),
     Resume(Instant, ResumedEvent),
-    ///Old VoiceState / New VoiceState
-    VoiceUpdate(Option<VoiceState>, VoiceState),
+    ///Old VoiceState / New VoiceState / Detecting Bot
+    VoiceUpdate(Option<VoiceState>, VoiceState, UserId),
+    BulkReactionDelete(ChannelId, MessageId),
 }
 
 impl Event {
     pub fn is_cached(&self) -> bool {
         matches!(self, Event::NewMessage(_))
             || matches!(self, Event::DeleteMessage(_, _))
-            || matches!(self, Event::VoiceUpdate(_, _))
+            || matches!(self, Event::VoiceUpdate(_, _, _))
     }
 }
 
@@ -57,12 +58,15 @@ impl PartialEq for Event {
                 m1.id == m2.id && m1.channel_id == m2.channel_id
             }
             (Event::DeleteMessage(c1, m1), Event::DeleteMessage(c2, m2)) => m1 == m2 && c1 == c2,
-            (Event::VoiceUpdate(o1, n1), Event::VoiceUpdate(o2, n2)) => o1
+            (Event::VoiceUpdate(o1, n1, _), Event::VoiceUpdate(o2, n2, _)) => o1
                 .is_some()
                 .eq(&o2.is_some())
                 .bitand(n1.session_id.eq(&n2.session_id))
                 .bitand(n1.user_id.eq(&n2.user_id))
                 .bitand(n1.channel_id.eq(&n2.channel_id)),
+            (Event::BulkReactionDelete(c1, m1), Event::BulkReactionDelete(c2, m2)) => {
+                m1 == m2 && c1 == c2
+            }
             (_, _) => false,
         }
     }
@@ -113,7 +117,8 @@ impl EventHandler {
             Event::NewMessage(msg) => handler.new_message(msg).await,
             Event::DeleteMessage(ch, msg) => handler.deleted_message(ch, msg).await,
             Event::Resume(t, e) => handler.resume(t, e).await,
-            Event::VoiceUpdate(ov, nv) => handler.voice_update(ov, nv).await,
+            Event::VoiceUpdate(ov, nv, bot) => handler.voice_update(ov, nv, bot).await,
+            Event::BulkReactionDelete(ch, msg) => handler.bulk_reaction_delete(ch, msg).await,
         }
         Ok(())
     }
@@ -144,7 +149,10 @@ impl EventHandler {
                 }
             }
             drop(read_lock);
-            info!("Got new Shard: {:?}, {:?}", ctx.shard_id, guild_id);
+            info!(
+                "Got new Shard: {:?}, {:?}, Bot: {:?}",
+                ctx.shard_id, guild_id, bot_id
+            );
             guild
                 .write()
                 .await
@@ -155,6 +163,12 @@ impl EventHandler {
 
 #[async_trait]
 impl SerenityEventHandler for EventHandler {
+    async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
+        for guild_id in guilds {
+            self.replace_shard_sender(ctx.clone(), guild_id).await;
+        }
+    }
+
     async fn message(&self, ctx: Context, new_message: Message) {
         let guild_id = match new_message.guild_id {
             Some(guild_id) => guild_id,
@@ -182,6 +196,25 @@ impl SerenityEventHandler for EventHandler {
         EventHandler::handle_result(self.process(guild_id, event).await);
     }
 
+    async fn reaction_remove_all(
+        &self,
+        ctx: Context,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) {
+        let ch = match ctx.cache.channel(channel_id).await {
+            Some(msg) => msg,
+            None => return,
+        };
+        let guild_id = match ch.guild() {
+            Some(guild_ch) => guild_ch.guild_id,
+            None => return,
+        };
+
+        let event = Event::BulkReactionDelete(channel_id, message_id);
+        EventHandler::handle_result(self.process(guild_id, event).await);
+    }
+
     async fn resume(&self, _: Context, r: ResumedEvent) {
         //To every Guild
         let now = Instant::now();
@@ -194,7 +227,7 @@ impl SerenityEventHandler for EventHandler {
 
     async fn voice_state_update(
         &self,
-        _: Context,
+        ctx: Context,
         guild_id: Option<GuildId>,
         old: Option<VoiceState>,
         new: VoiceState,
@@ -205,7 +238,7 @@ impl SerenityEventHandler for EventHandler {
         };
 
         //Send Event to Guild
-        let event = Event::VoiceUpdate(old, new);
+        let event = Event::VoiceUpdate(old, new, ctx.cache.current_user_id().await);
         EventHandler::handle_result(self.process(guild_id, event).await);
     }
 }

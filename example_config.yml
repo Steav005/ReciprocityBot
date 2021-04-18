@@ -1,0 +1,13 @@
+bots:
+  TohruTest: abc
+  MyaTest: abc
+guilds:
+  fipponarci:
+    guild_id: 11
+    channel_id: 12
+  ffp:
+    guild_id: 21
+    channel_id: 22
+lavalink:
+  address: "autumnal.de"
+  password: "youshallnotpass"

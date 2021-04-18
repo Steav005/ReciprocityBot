@@ -3,13 +3,14 @@ use crate::context::{Context, GuildEventHandler};
 use crate::guild::scheduler::GuildScheduler;
 use crate::guild::ReciprocityGuild;
 use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
-use futures::FutureExt;
+use futures::{Future, FutureExt};
 use lavalink_rs::model::Track;
+use log::{info, warn};
 use serenity::client::bridge::gateway::ShardMessenger;
 use serenity::collector::ReactionAction;
 use serenity::http::Http;
 use serenity::model::prelude::{
-    ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, UserId,
+    ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, User, UserId,
 };
 use serenity::prelude::SerenityError;
 use serenity::utils::MessageBuilder;
@@ -42,7 +43,12 @@ async fn add_emotes(
         reaction: emote.reaction(),
     }) {
         //Add single emote and wait for completion
-        scheduler.process(task).await.ok();
+        if let Err(e) = scheduler.process(task).await {
+            warn!(
+                "Error Adding Emote to Search Message: {:?}, Error: {:?}",
+                message, e
+            );
+        }
     }
 }
 
@@ -52,14 +58,34 @@ impl SearchMessage {
     pub async fn search(
         bot: Arc<Http>,
         tracks: Vec<Track>,
-        requester: UserId,
+        requester: User,
+        query: String,
         shard_messenger: impl AsRef<ShardMessenger>,
         context: Context,
     ) -> Result<Track, MessageError> {
-        let message = context.channel
-            .send_message(bot, |m| m.content(Self::content(tracks.as_slice())))
+        info!(
+            "New Search Message. Guild: {:?}, User: {:?}, Query: {:?}",
+            context.id, requester.id, query
+        );
+        let message = context
+            .channel
+            .send_message(bot, |m| {
+                m.content(Self::content(tracks.as_slice(), &query, &requester))
+            })
             .await
             .map_err(MessageError::SerenityError)?;
+
+        //Delete old message and add new id to the message map
+        let mut messages_lock = context.search_messages.write().await;
+        if let Some(old_id) = messages_lock.get(&requester.id) {
+            let delete_task = DeleteMessageTask {
+                channel: context.channel,
+                message: *old_id,
+            };
+            context.scheduler.process_enqueue(delete_task).await.ok();
+        }
+        messages_lock.insert(requester.id, message.id);
+        drop(messages_lock);
 
         //Build emotes, that we are using with this message
         let emotes: Arc<Vec<_>> = Arc::new(
@@ -76,7 +102,7 @@ impl SearchMessage {
         let collector = message
             .await_reaction(&shard_messenger)
             .timeout(SEARCH_TIMEOUT)
-            .author_id(requester.0)
+            .author_id(requester.id.0)
             .removed(false)
             .added(true)
             .filter(filter)
@@ -109,22 +135,24 @@ impl SearchMessage {
         track
     }
 
-    fn content(tracks: &[Track]) -> String {
-        let mut content = format!("");
-        for (i, track) in tracks.iter().enumerate().take(10){
-            write!(content,
+    fn content(tracks: &[Track], query: &str, requester: &User) -> String {
+        let mut content = format!("[{}] {:.*}\r\n", query, 16, requester.name);
+        for (i, track) in tracks.iter().enumerate().take(10) {
+            write!(
+                content,
                 "{}: {:.*}\r\n",
                 i + 1,
                 SEARCH_TITLE_LIMIT,
                 track
                     .clone()
                     .info
-                    .map_or("Missing Name".to_string(), |info| info
-                        .title)).unwrap()
+                    .map_or("Missing Name".to_string(), |info| info.title)
+            )
+            .unwrap()
         }
 
         let content = MessageBuilder::new()
-            .push_codeblock(content, Some("css"))
+            .push_codeblock(content, Some("cs"))
             .build();
         content
     }
@@ -150,7 +178,11 @@ impl MainMessage {
         EmoteAction::Leave(),
     ];
 
-    pub async fn new(guild: ReciprocityGuild, context: Context) -> Result<Self, MessageError> {
+    pub async fn new(
+        guild: ReciprocityGuild,
+        context: Context,
+    ) -> Result<(Self, impl Future<Output = ()>), MessageError> {
+        info!("Start new Main Message. Guild: {:?}", context.id);
         let bot = context
             .bots
             .get_any_guild_bot(&context.id)
@@ -163,7 +195,8 @@ impl MainMessage {
             .ok_or_else(|| MessageError::NoShard(bot.id()))?;
 
         let content = Self::content(&context).await;
-        let message = context.channel
+        let message = context
+            .channel
             .send_message(bot.http(), |m| m.content(content))
             .await
             .map_err(MessageError::SerenityError)?;
@@ -175,8 +208,7 @@ impl MainMessage {
             context,
         };
         tokio::spawn(main_message.clone().update());
-        tokio::spawn(main_message.clone().run(guild));
-        Ok(main_message)
+        Ok((main_message.clone(), main_message.run(guild)))
     }
 
     pub async fn run(self, guild: ReciprocityGuild) {
@@ -189,6 +221,10 @@ impl MainMessage {
             .removed(true)
             .await;
 
+        info!(
+            "Starting Message Collector for Main Message: {:?}, Guild: {:?}",
+            self.message.id, self.context.id
+        );
         while let Some(reaction) = collector.next().await {
             match reaction.deref() {
                 ReactionAction::Added(reaction) => {
@@ -234,10 +270,23 @@ impl MainMessage {
                 }
             }
         }
+    }
 
-        guild
-            .main_message_error(MessageError::UnexpectedEnd())
-            .await
+    pub async fn message_still_exists(&self) -> bool {
+        let msg = self
+            .bot
+            .http()
+            .get_message(self.message.channel_id.0, self.message.id.0)
+            .await;
+        msg.is_ok()
+    }
+
+    pub fn message_id(&self) -> MessageId {
+        self.message.id
+    }
+
+    pub fn channel_id(&self) -> ChannelId {
+        self.message.channel_id
     }
 
     async fn update(self) {
@@ -248,19 +297,25 @@ impl MainMessage {
             if message.content.eq(content.as_str()) {
                 continue;
             }
+            info!(
+                "Updating Message: {:?}, Guild: {:?}",
+                message.id, self.context.id
+            );
             let edit_res = message
                 .edit(self.bot.cache_http(), |msg| msg.content(content))
                 .await;
-            if edit_res.is_err() {
+            if let Err(e) = edit_res {
                 //BREAK Update Loop if error occurred
+                warn!(
+                    "Error updating Message: {:?}, Guild: {:?}, Error: {:?}",
+                    message.id, self.context.id, e
+                );
                 return;
             }
         }
     }
 
-    async fn emote_check(self) {
-        //TODO Log
-
+    pub async fn emote_check(self) {
         let lock = self.lock.lock().await;
 
         //Get fresh msg
@@ -271,7 +326,10 @@ impl MainMessage {
             .await
         {
             Ok(msg) => msg,
-            Err(_) => return,
+            Err(e) => {
+                warn!("Error getting Message for emote check. Guild: {:?}, Message: {:?}, Error: {:?}", self.context.id, self.message.id, e);
+                return;
+            }
         };
 
         //Check if any reaction is missing
@@ -284,9 +342,18 @@ impl MainMessage {
             return;
         }
 
+        info!(
+            "Message is missing emote: {:?}, {:?}",
+            self.context.id, msg.id
+        );
+
         //Delete all Reactions
         let delete_all_res = msg.delete_reactions(self.bot.cache_http()).await;
-        if delete_all_res.is_err() {
+        if let Err(e) = delete_all_res {
+            warn!(
+                "Error deleting Reactions for Message: {:?}, Error: {:?}",
+                msg.id, e
+            );
             return;
         }
 
@@ -298,7 +365,11 @@ impl MainMessage {
                 reaction: e.reaction(),
             };
             let add_res = self.context.scheduler.process(task).await;
-            if add_res.is_err() {
+            if let Err(e) = add_res {
+                warn!(
+                    "Error adding Reaction to Message: {:?}, Error: {:?}",
+                    msg.id, e
+                );
                 return;
             }
         }
@@ -319,7 +390,7 @@ impl MainMessage {
     }
 
     async fn content(context: &Context) -> String {
-        let mut msg: String = "```css\r\n".to_string();
+        let mut msg: String = "```cs\r\n".to_string();
         let states = context.player_manager.get_all_player_states().await;
         let mut active_player = 0;
 
@@ -328,20 +399,28 @@ impl MainMessage {
                 if let Some(bot) = bot.cache().member(context.id, state.bot).await {
                     active_player += 1;
 
-                    write!(
-                        msg,
-                        "[{}] {}\r\n",
-                        bot.nick.unwrap_or(bot.user.name),
-                        state.play_state.as_ref()
-                    )
-                    .unwrap();
+                    write!(msg, "[{}]", bot.nick.unwrap_or(bot.user.name)).unwrap();
+
+                    if state.current.is_none() && state.playlist.is_empty() {
+                        write!(msg, " No Song in Playlist\r\n").unwrap();
+                    } else {
+                        write!(msg, " {}\r\n", state.playback.to_string()).unwrap();
+                    }
+
                     if let Some(((dur, when), cur)) = &state.current {
                         write!(
                             msg,
-                            "[CURRENT] {:.*} [{}]\r\n",
+                            "{:.*} [{}/{}]\r\n",
                             SEARCH_TITLE_LIMIT,
-                            cur.info.clone().map_or("No Track Name".to_string(), |i| i.title),
-                            Self::duration_fmt(&(when.elapsed() + *dur))
+                            cur.info
+                                .clone()
+                                .map_or("No Track Name".to_string(), |i| i.title),
+                            Self::duration_fmt(&(when.elapsed() + *dur)),
+                            cur.info
+                                .clone()
+                                .map_or("--:--".to_string(), |i| Self::duration_fmt(
+                                    &Duration::from_millis(i.length)
+                                ))
                         )
                         .unwrap();
                     }
@@ -351,7 +430,10 @@ impl MainMessage {
                             "[{}] {:.*}\r\n",
                             i + 1,
                             SEARCH_TITLE_LIMIT,
-                            track.info.clone().map_or("No Track Name".to_string(), |i| i.title)
+                            track
+                                .info
+                                .clone()
+                                .map_or("No Track Name".to_string(), |i| i.title)
                         )
                         .unwrap();
                     }
@@ -361,8 +443,8 @@ impl MainMessage {
         }
 
         //If there are no active Player
-        if active_player == 0{
-            write!(msg, "No active Player").unwrap();
+        if active_player == 0 {
+            write!(msg, "[No active Player]").unwrap();
         }
 
         write!(msg, "```").unwrap();

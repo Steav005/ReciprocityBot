@@ -13,6 +13,7 @@ use songbird::Songbird;
 use thiserror::Error;
 use tokio::sync::watch::{Receiver as WatchReceiver, Sender as WatchSender};
 
+use std::fmt::{Display, Formatter};
 use strum_macros::AsRefStr;
 
 const MUSIC_QUEUE_LIMIT: usize = 100;
@@ -344,6 +345,16 @@ pub enum Playback {
     Normal,
     AllLoop,
     OneLoop,
+}
+
+impl Display for Playback {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Playback::Normal => Ok(()),
+            Playback::AllLoop => write!(f, "🔁"),
+            Playback::OneLoop => write!(f, "🔂"),
+        }
+    }
 }
 
 #[derive(Error, Debug)]

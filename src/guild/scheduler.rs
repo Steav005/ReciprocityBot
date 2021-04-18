@@ -1,11 +1,10 @@
+use serenity::futures::stream::StreamExt;
+use serenity::model::prelude::{ChannelId, GuildId};
 use std::borrow::BorrowMut;
 use std::collections::HashMap;
 use std::iter::Iterator;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use serenity::futures::stream::StreamExt;
-use serenity::model::prelude::{ChannelId, GuildId};
 
 use strum::IntoEnumIterator;
 use thiserror::Error;
@@ -63,6 +62,9 @@ impl GuildScheduler {
         Err(SchedulerError::NoRouteScheduler(route))
     }
 
+    ///Process Task, but does not wait to completion.
+    /// - Returns Error, if channel is full
+    /// - Returns nothing if enqueued successfully
     pub async fn process_enqueue(&self, task: impl Task + 'static) -> Result<(), SchedulerError> {
         let route = task.route();
         let (handle, _) = TaskHandle::new(task);
@@ -138,7 +140,7 @@ impl RouteScheduler {
         RouteScheduler { send }
     }
 
-    pub fn enqueue(&self, task: TaskHandle) -> Result<(), SchedulerError> {
+    fn enqueue(&self, task: TaskHandle) -> Result<(), SchedulerError> {
         self.send.try_send(task).map_err(SchedulerError::SendError)
     }
 }

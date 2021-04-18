@@ -73,6 +73,33 @@ impl BotMap {
         false
     }
 
+    ///Returns whether non-bot users are in a channel or not using a specific bot
+    pub async fn user_in_channel_with_bot(
+        &self,
+        channel: &ChannelId,
+        guild: &GuildId,
+        bot: UserId,
+    ) -> Option<bool> {
+        let bot = self.get_bot_by_id(bot)?;
+        if let Some(voice_states) = bot
+            .cache
+            .guild_field(guild, |g| g.voice_states.clone())
+            .await
+        {
+            for (user, state) in voice_states {
+                if state.channel_id.unwrap_or(ChannelId(0)).eq(channel).not() {
+                    continue;
+                }
+                if let Some(user) = bot.cache.user(user).await {
+                    if !user.bot {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+        Some(false)
+    }
+
     pub fn contains_id(&self, bot: &UserId) -> bool {
         self.bots.iter().any(|b| b.id.eq(bot))
     }
