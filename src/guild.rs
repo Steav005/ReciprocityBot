@@ -24,6 +24,7 @@ use std::borrow::Borrow;
 use std::ops::Deref;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use url::Url;
 
 pub mod message_manager;
 pub mod player_manager;
@@ -67,6 +68,7 @@ impl ReciprocityGuild {
             },
         };
 
+        tokio::spawn(Self::clear_messages(guild.0.clone()));
         let cloned_guild = guild.clone();
         tokio::spawn(async move { cloned_guild.check_main_message().await });
         //tokio::spawn(async move {
@@ -76,6 +78,44 @@ impl ReciprocityGuild {
         //});
 
         Ok(guild)
+    }
+
+    //Delete every irrelevant message
+    async fn clear_messages(ctx: Context){
+        //TODO hacky sleep abändern
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+
+        info!("Starting clear_messages in {:?}", ctx.id);
+        let bot = ctx.bots.get_any_guild_bot(&ctx.id).await;
+        let bot = match bot{
+            None => {
+                warn!("Could not get a Bot for Guild: {:?}", ctx.id);
+                return;
+            }
+            Some(bot) => bot,
+        };
+
+        let mut i = 0;
+        while let Ok(mut msgs) = ctx.channel.messages(bot.http(), |b| b.limit(200)).await {
+            let s = ctx.main_message.read().await.as_ref().map(|(msg, _)| msg.message_id());
+            let msgs = msgs.drain(..).filter(|m| !Some(m.id).eq(&s));
+            let searches: Vec<_> = ctx.search_messages.read().await.values().copied().collect();
+            let msgs: Vec<_> = msgs.filter(|m| !searches.contains(&m.id)).collect();
+            if msgs.is_empty(){
+                return;
+            }
+            info!("Attempting to delete {} Messages in Guild: {:?}", msgs.len(), ctx.id);
+            let del_res = ctx.channel.delete_messages(bot.http(), msgs).await;
+            if let Err(e) = del_res{
+                warn!("Bulk Message Delete Error: Guild: {:?}, Error: {:?}", ctx.id, e);
+            }
+            if i == 4{
+                return;
+            }
+            i += 1;
+        }
+        
     }
 }
 
@@ -148,6 +188,25 @@ impl GuildEventHandler for ReciprocityGuild {
             }
         }
 
+        //Recheck user voice state
+        let same_voice_state = match self
+            .0
+            .bots
+            .get_user_voice_state(&message.author.id, &self.0.id)
+            .await
+        {
+            None => false,
+            Some(v) => v.channel_id.eq(&Some(voice_channel)),
+        };
+
+        //Should the voice state have changed, exit and stop player
+        if !same_voice_state{
+            if let Err(e) = self.0.player_manager.leave(voice_channel).await{
+                warn!("Error leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e);
+            }
+            return;
+        }
+
         //Start search
         let search_res = self
             .0
@@ -175,54 +234,59 @@ impl GuildEventHandler for ReciprocityGuild {
             return;
         }
 
-        //Get relevant stuff for the search message
-        let http = bot.http().clone();
-        let requester = message.author;
-        let shard = match self
-            .0
-            .event_handler
-            .get_shard_sender(self.0.id, bot.id())
-            .await
-        {
-            None => {
-                warn!(
-                    "No Shard was found for Guild/Bot. Guild: {}, Bot: {}",
-                    self.0.id,
-                    bot.id()
-                );
-                return;
-            }
-            Some(shard) => shard,
-        };
+        //If query was not a valid url
+        let tracks = if Url::parse(&message.content).is_err() {
+            //Get relevant stuff for the search message
+            let http = bot.http().clone();
+            let requester = message.author;
+            let shard = match self
+                .0
+                .event_handler
+                .get_shard_sender(self.0.id, bot.id())
+                .await
+            {
+                None => {
+                    warn!(
+                        "No Shard was found for Guild/Bot. Guild: {}, Bot: {}",
+                        self.0.id,
+                        bot.id()
+                    );
+                    return;
+                }
+                Some(shard) => shard,
+            };
 
-        //Run the search message for determining a track
-        let search_message_res = SearchMessage::search(
-            http,
-            songs,
-            requester,
-            message.content,
-            shard,
-            self.0.clone(),
-        )
-        .await;
-        let track = match search_message_res {
-            Ok(track) => track,
-            Err(e) => {
-                warn!("Search Message Error occurred: {:?}", e);
-                return;
+            //Run the search message for determining a track
+            let search_message_res = SearchMessage::search(
+                http,
+                songs,
+                requester,
+                message.content,
+                shard,
+                self.0.clone(),
+            )
+            .await;
+            match search_message_res {
+                Ok(track) => vec![track],
+                Err(e) => {
+                    warn!("Search Message Error occurred: {:?}", e);
+                    return;
+                }
             }
+        } else {
+            songs
         };
 
         let enqueue_res = self
             .0
             .player_manager
             .request(PlayerRequest::Enqueue {
-                0: track,
+                0: tracks,
                 1: voice_channel,
             })
             .await;
         match enqueue_res {
-            Ok(_) => return,
+            Ok(_) => {}
             Err(e) => {
                 warn!("Error enqueuing song: {:?}", e);
                 return;
@@ -232,19 +296,28 @@ impl GuildEventHandler for ReciprocityGuild {
 
     async fn deleted_message(&self, channel: ChannelId, message: MessageId) {
         //Exit if channel is irrelevant
-        if channel != self.0.channel{
+        if channel != self.0.channel {
             return;
         }
 
-        if let Some((msg, _)) = self.0.main_message.read().await.deref(){
-            //Exit if message id is irrelevant
-            if msg.message_id() != message{
+        //Check Main Message
+        if let Some((msg, _)) = self.0.main_message.read().await.deref() {
+            if msg.message_id() == message {
+                //Now check if the main message is alright
+                self.check_main_message().await;
                 return;
             }
         }
 
-        //Now check if the main message is alright
-        self.check_main_message().await;
+        //Check Search Messages
+        let contains = self.0.search_messages.read().await.values().any(|msg| message.eq(msg));
+        if contains {
+            let mut search_lock = self.0.search_messages.write().await;
+            if let Some(user) = search_lock.iter().find(|(_, msg)| message.eq(*msg)).map(|(user, _)| *user){
+                search_lock.remove(&user);
+            }
+            drop(search_lock);
+        }
     }
 
     async fn bulk_reaction_delete(&self, channel: ChannelId, message: MessageId) {
@@ -259,7 +332,7 @@ impl GuildEventHandler for ReciprocityGuild {
         };
 
         //Exit if Message id is wrong
-        if msg.message_id() != message{
+        if msg.message_id() != message {
             return;
         }
 
@@ -274,11 +347,11 @@ impl GuildEventHandler for ReciprocityGuild {
     async fn voice_update(
         &self,
         old_voice_state: Option<VoiceState>,
-        _new_voice_state: VoiceState,
+        new_voice_state: VoiceState,
         bot: UserId,
     ) {
         //Only continue if old Channel exists
-        let voice_channel = match old_voice_state {
+        let voice_channel = match &old_voice_state {
             None => {
                 info!(
                     "Ignoring Voice Update, because old one was None: Guild: {:?}",
@@ -298,27 +371,60 @@ impl GuildEventHandler for ReciprocityGuild {
             },
         };
 
-        //Ignore if there are still user in the channel
-        match self
-            .0
-            .bots
-            .user_in_channel_with_bot(&voice_channel, &self.0.id, bot)
-            .await
-        {
-            None => return,
-            Some(in_channel) => {
-                if in_channel {
-                    info!("Ignoring Leave, because there are still user in the channel: Guild: {:?}, Channel: {:?}", self.0.id, voice_channel);
-                    return;
+        //Branch if moved user is our bot
+        match self.0.bots.contains_id(&new_voice_state.user_id){
+            true => {
+                //Only do something if the new_voice_state is a channel
+                if new_voice_state.channel_id.is_some() {
+                    //And if the old voice state is not non
+                    if let Some(old_vc) = old_voice_state {
+                        if let Some(old_ch) = old_vc.channel_id {
+                            info!("Bot was moved. Guild: {:?}, Old Channel: {:?}, New Channel: {:?}, Bot: {:?}", self.0.id, old_ch, new_voice_state, &new_voice_state.user_id);
+                            if let Err(e) = self.0.player_manager.leave(old_ch).await{
+                                warn!("Error leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e);
+                            }
+                        }
+                    }
+                }
+            }
+            false => {
+                //Delete Search Message if it exists
+                let search = self.0.search_messages.write().await.remove(&new_voice_state.user_id);
+                if let Some(msg) = search{
+                    info!("Removing Search Message, because User left. Guild: {:?}, User: {:?}, Message: {:?}", self.0.id, new_voice_state.user_id, msg);
+                    let del_task = DeleteMessageTask{
+                        channel: self.0.channel,
+                        message: msg
+                    };
+                    if let Err(e) = self.0.scheduler.process_enqueue(del_task).await {
+                        warn!("Error queueing Search Message delete Task. Guild: {:?}, Message: {:?}, Error: {:?}", self.0.id, msg, e);
+                    }
+                }
+
+                //Ignore if there are still user in the channel
+                match self
+                    .0
+                    .bots
+                    .user_in_channel_with_bot(&voice_channel, &self.0.id, bot)
+                    .await
+                {
+                    None => return,
+                    Some(in_channel) => {
+                        if in_channel {
+                            info!("Ignoring Leave, because there are still user in the channel: Guild: {:?}, Channel: {:?}", self.0.id, voice_channel);
+                            return;
+                        }
+                    }
+                }
+
+                let leave_res = self.0.player_manager.leave(voice_channel).await;
+                match leave_res {
+                    Ok(_) => info!("Successfully left Channel, due to users leaving. Guild: {:?}, Channel: {:?}", self.0.id, voice_channel),
+                    Err(e) => warn!("Error leaving Channel, due to users leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e),
                 }
             }
         }
 
-        let leave_res = self.0.player_manager.leave(voice_channel).await;
-        match leave_res {
-            Ok(_) => info!("Successfully left Channel, due to users leaving. Guild: {:?}, Channel: {:?}", self.0.id, voice_channel),
-            Err(e) => warn!("Error leaving Channel, due to users leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e),
-        }
     }
 
     async fn lavalink(&self, event: LavalinkEvent, client: LavalinkClient) {

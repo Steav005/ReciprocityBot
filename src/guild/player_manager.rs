@@ -96,8 +96,8 @@ impl PlayerManager {
                 .dynamic_pause_resume()
                 .await
                 .map_err(PlayerMapError::PlayerError),
-            PlayerRequest::Enqueue(track, _) => player
-                .enqueue(track)
+            PlayerRequest::Enqueue(mut tracks, _) => player
+                .enqueue(tracks.drain(..))
                 .await
                 .map_err(PlayerMapError::PlayerError),
         }
@@ -291,7 +291,7 @@ pub enum PlayerRequest {
     ClearQueue(ChannelId),
     Playback(Playback, ChannelId),
     PauseResume(ChannelId),
-    Enqueue(Track, ChannelId),
+    Enqueue(Vec<Track>, ChannelId),
 }
 
 impl PlayerRequest {

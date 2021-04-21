@@ -173,11 +173,16 @@ impl Player {
             .map_err(PlayerError::Lavalink)
     }
 
-    pub async fn enqueue(&mut self, track: Track) -> Result<(), PlayerError> {
-        self.player_state
-            .playlist
-            .push_back(track)
-            .map_err(PlayerError::PlaylistFull)?;
+    pub async fn enqueue(
+        &mut self,
+        tracks: impl Iterator<Item = Track>,
+    ) -> Result<(), PlayerError> {
+        for (i, track) in tracks.enumerate() {
+            let res = self.player_state.playlist.push_back(track);
+            if i == 0 {
+                res.map_err(PlayerError::PlaylistFull)?;
+            }
+        }
 
         if self.player_state.current.is_none() {
             self.play_next().await?;
@@ -226,7 +231,7 @@ impl Player {
     {
         let lavalink = self.lavalink.clone();
         tokio::spawn(async move {
-            match lavalink.search_tracks(query).await {
+            match lavalink.auto_search_tracks(query).await {
                 Err(e) => callback(Err(PlayerError::Lavalink(e))).await,
                 Ok(tracks) => {
                     if tracks.load_type.eq("LOAD_FAILED") {

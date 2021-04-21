@@ -11,11 +11,12 @@ use serenity::prelude::Context;
 use std::collections::HashMap;
 use std::ops::BitAnd;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
 pub const CACHE_SIZE: usize = 100;
+pub const VOICE_STATE_MAX_DIFF: Duration = Duration::from_millis(500);
 
 type Cache = Arc<Mutex<ArrayDeque<[Event; CACHE_SIZE]>>>;
 type EventHandlerGuild = (Cache, Arc<dyn GuildEventHandler>);
@@ -39,7 +40,7 @@ pub enum Event {
     DeleteMessage(ChannelId, MessageId),
     Resume(Instant, ResumedEvent),
     ///Old VoiceState / New VoiceState / Detecting Bot
-    VoiceUpdate(Option<VoiceState>, VoiceState, UserId),
+    VoiceUpdate(Option<VoiceState>, VoiceState, UserId, Instant),
     BulkReactionDelete(ChannelId, MessageId),
 }
 
@@ -47,7 +48,15 @@ impl Event {
     pub fn is_cached(&self) -> bool {
         matches!(self, Event::NewMessage(_))
             || matches!(self, Event::DeleteMessage(_, _))
-            || matches!(self, Event::VoiceUpdate(_, _, _))
+            || matches!(self, Event::VoiceUpdate(_, _, _, _))
+    }
+}
+
+pub fn duration_diff(dur1: Duration, dur2: Duration) -> Duration{
+    if dur1 > dur2{
+        dur1 - dur2
+    } else {
+        dur2 - dur1
     }
 }
 
@@ -58,12 +67,18 @@ impl PartialEq for Event {
                 m1.id == m2.id && m1.channel_id == m2.channel_id
             }
             (Event::DeleteMessage(c1, m1), Event::DeleteMessage(c2, m2)) => m1 == m2 && c1 == c2,
-            (Event::VoiceUpdate(o1, n1, _), Event::VoiceUpdate(o2, n2, _)) => o1
-                .is_some()
-                .eq(&o2.is_some())
-                .bitand(n1.session_id.eq(&n2.session_id))
-                .bitand(n1.user_id.eq(&n2.user_id))
-                .bitand(n1.channel_id.eq(&n2.channel_id)),
+            (Event::VoiceUpdate(o1, n1, _, i1), Event::VoiceUpdate(o2, n2, _, i2)) => {
+                let diff = duration_diff(i1.elapsed(), i2.elapsed());
+                if diff > VOICE_STATE_MAX_DIFF{
+                    return false;
+                }
+                o1
+                    .is_some()
+                    .eq(&o2.is_some())
+                    .bitand(n1.session_id.eq(&n2.session_id))
+                    .bitand(n1.user_id.eq(&n2.user_id))
+                    .bitand(n1.channel_id.eq(&n2.channel_id))
+            },
             (Event::BulkReactionDelete(c1, m1), Event::BulkReactionDelete(c2, m2)) => {
                 m1 == m2 && c1 == c2
             }
@@ -117,7 +132,7 @@ impl EventHandler {
             Event::NewMessage(msg) => handler.new_message(msg).await,
             Event::DeleteMessage(ch, msg) => handler.deleted_message(ch, msg).await,
             Event::Resume(t, e) => handler.resume(t, e).await,
-            Event::VoiceUpdate(ov, nv, bot) => handler.voice_update(ov, nv, bot).await,
+            Event::VoiceUpdate(ov, nv, bot, _) => handler.voice_update(ov, nv, bot).await,
             Event::BulkReactionDelete(ch, msg) => handler.bulk_reaction_delete(ch, msg).await,
         }
         Ok(())
@@ -237,8 +252,10 @@ impl SerenityEventHandler for EventHandler {
             None => return,
         };
 
+        let now = Instant::now();
+
         //Send Event to Guild
-        let event = Event::VoiceUpdate(old, new, ctx.cache.current_user_id().await);
+        let event = Event::VoiceUpdate(old, new, ctx.cache.current_user_id().await, now);
         EventHandler::handle_result(self.process(guild_id, event).await);
     }
 }

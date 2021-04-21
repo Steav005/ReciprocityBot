@@ -1,6 +1,5 @@
 use crate::bots::Bot;
 use crate::context::{Context, GuildEventHandler};
-use crate::guild::scheduler::GuildScheduler;
 use crate::guild::ReciprocityGuild;
 use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
 use futures::{Future, FutureExt};
@@ -32,18 +31,25 @@ const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 ///Adds a list of emotes to a message
 async fn add_emotes(
+    context: Context,
     message: MessageId,
-    channel: ChannelId,
+    requester: UserId,
     emotes: Arc<Vec<EmoteAction>>,
-    scheduler: GuildScheduler,
 ) {
     for task in emotes.iter().map(|emote| AddMessageReactionTask {
-        channel,
+        channel: context.channel,
         message,
         reaction: emote.reaction(),
     }) {
+        if let Some(msg) = context.search_messages.read().await.get(&requester) {
+            if !message.eq(msg) {
+                warn!("Stop Adding Emotes, because Search Message is no longer relevant. Guild: {:?}, Message: {:?}", context.id, message);
+                return;
+            }
+        }
+
         //Add single emote and wait for completion
-        if let Err(e) = scheduler.process(task).await {
+        if let Err(e) = context.scheduler.process(task).await {
             warn!(
                 "Error Adding Emote to Search Message: {:?}, Error: {:?}",
                 message, e
@@ -77,19 +83,20 @@ impl SearchMessage {
 
         //Delete old message and add new id to the message map
         let mut messages_lock = context.search_messages.write().await;
-        if let Some(old_id) = messages_lock.get(&requester.id) {
-            let delete_task = DeleteMessageTask {
+        if let Some(old_id) = messages_lock.insert(requester.id, message.id) {
+            let task = DeleteMessageTask {
                 channel: context.channel,
-                message: *old_id,
+                message: old_id,
             };
-            context.scheduler.process_enqueue(delete_task).await.ok();
+            drop(messages_lock);
+            context.scheduler.process_enqueue(task).await.ok();
+        } else {
+            drop(messages_lock);
         }
-        messages_lock.insert(requester.id, message.id);
-        drop(messages_lock);
 
         //Build emotes, that we are using with this message
         let emotes: Arc<Vec<_>> = Arc::new(
-            (1..tracks.len())
+            (1..(tracks.len() + 1))
                 .take(10)
                 .map(EmoteAction::Number)
                 .chain(vec![EmoteAction::Delete()])
@@ -116,10 +123,10 @@ impl SearchMessage {
                 None
             });
         tokio::spawn(add_emotes(
+            context.clone(),
             message.id,
-            context.channel,
+            requester.id,
             emotes_1.clone(),
-            context.scheduler.clone(),
         ));
         let track: Result<Track, MessageError> = collector.await.ok_or(MessageError::Timeout());
 
@@ -132,11 +139,20 @@ impl SearchMessage {
             .await
             .ok();
 
+        //Remove message id if message is still in map
+        let mut messages_lock = context.search_messages.write().await;
+        if let Some(msg) = messages_lock.get(&requester.id){
+            if message.id.eq(msg){
+                messages_lock.remove(&requester.id);
+            }
+        }
+        drop(messages_lock);
+
         track
     }
 
     fn content(tracks: &[Track], query: &str, requester: &User) -> String {
-        let mut content = format!("[{}] {:.*}\r\n", query, 16, requester.name);
+        let mut content = format!("[{:.*}] @{}\r\n", SEARCH_TITLE_LIMIT, query, requester.name);
         for (i, track) in tracks.iter().enumerate().take(10) {
             write!(
                 content,
@@ -261,12 +277,13 @@ impl MainMessage {
                 }
                 ReactionAction::Removed(reaction) => {
                     if let Some(user) = &reaction.user_id {
-                        if !self.context.bots.contains_id(user) {
-                            continue;
+                        if self.context.bots.contains_id(user) {
+                            tokio::spawn(self.clone().rebuild_emotes());
                         }
+                    } else {
+                        // Check Message
+                        tokio::spawn(self.clone().emote_check());
                     }
-                    // Check Message
-                    tokio::spawn(self.clone().emote_check());
                 }
             }
         }
@@ -369,6 +386,39 @@ impl MainMessage {
                 warn!(
                     "Error adding Reaction to Message: {:?}, Error: {:?}",
                     msg.id, e
+                );
+                return;
+            }
+        }
+
+        drop(lock)
+    }
+
+    pub async fn rebuild_emotes(self) {
+        let lock = self.lock.lock().await;
+
+        //Delete all Reactions
+        let delete_all_res = self.message.delete_reactions(self.bot.cache_http()).await;
+        if let Err(e) = delete_all_res {
+            warn!(
+                "Error deleting Reactions for Message: {:?}, Error: {:?}",
+                self.message.id, e
+            );
+            return;
+        }
+
+        //Add Reactions one after another
+        for e in Self::EMOTES.iter() {
+            let task = AddMessageReactionTask {
+                channel: self.message.channel_id,
+                message: self.message.id,
+                reaction: e.reaction(),
+            };
+            let add_res = self.context.scheduler.process(task).await;
+            if let Err(e) = add_res {
+                warn!(
+                    "Error adding Reaction to Message: {:?}, Error: {:?}",
+                    self.message.id, e
                 );
                 return;
             }
