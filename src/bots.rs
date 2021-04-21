@@ -81,17 +81,17 @@ impl BotMap {
         bot: UserId,
     ) -> Option<bool> {
         let bot = self.get_bot_by_id(bot)?;
-        if let Some(voice_states) = bot
+        if let Some((voice_states, members)) = bot
             .cache
-            .guild_field(guild, |g| g.voice_states.clone())
+            .guild_field(guild, |g| (g.voice_states.clone(), g.members.clone()))
             .await
         {
             for (user, state) in voice_states {
                 if state.channel_id.unwrap_or(ChannelId(0)).eq(channel).not() {
                     continue;
                 }
-                if let Some(user) = bot.cache.user(user).await {
-                    if !user.bot {
+                if let Some(member) = members.get(&user) {
+                    if !member.user.bot {
                         return Some(true);
                     }
                 }

@@ -11,7 +11,7 @@ use serenity::prelude::Context;
 use std::collections::HashMap;
 use std::ops::BitAnd;
 use std::sync::Arc;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
@@ -42,6 +42,7 @@ pub enum Event {
     ///Old VoiceState / New VoiceState / Detecting Bot
     VoiceUpdate(Option<VoiceState>, VoiceState, UserId, Instant),
     BulkReactionDelete(ChannelId, MessageId),
+    CacheReady(UserId),
 }
 
 impl Event {
@@ -52,8 +53,8 @@ impl Event {
     }
 }
 
-pub fn duration_diff(dur1: Duration, dur2: Duration) -> Duration{
-    if dur1 > dur2{
+pub fn duration_diff(dur1: Duration, dur2: Duration) -> Duration {
+    if dur1 > dur2 {
         dur1 - dur2
     } else {
         dur2 - dur1
@@ -69,16 +70,15 @@ impl PartialEq for Event {
             (Event::DeleteMessage(c1, m1), Event::DeleteMessage(c2, m2)) => m1 == m2 && c1 == c2,
             (Event::VoiceUpdate(o1, n1, _, i1), Event::VoiceUpdate(o2, n2, _, i2)) => {
                 let diff = duration_diff(i1.elapsed(), i2.elapsed());
-                if diff > VOICE_STATE_MAX_DIFF{
+                if diff > VOICE_STATE_MAX_DIFF {
                     return false;
                 }
-                o1
-                    .is_some()
+                o1.is_some()
                     .eq(&o2.is_some())
                     .bitand(n1.session_id.eq(&n2.session_id))
                     .bitand(n1.user_id.eq(&n2.user_id))
                     .bitand(n1.channel_id.eq(&n2.channel_id))
-            },
+            }
             (Event::BulkReactionDelete(c1, m1), Event::BulkReactionDelete(c2, m2)) => {
                 m1 == m2 && c1 == c2
             }
@@ -127,13 +127,14 @@ impl EventHandler {
                 (event, handler.clone())
             }
         };
-        info!("Got new Event: {:?}", &event);
+        debug!("Got new Event: {:?}", &event);
         match event {
             Event::NewMessage(msg) => handler.new_message(msg).await,
             Event::DeleteMessage(ch, msg) => handler.deleted_message(ch, msg).await,
             Event::Resume(t, e) => handler.resume(t, e).await,
             Event::VoiceUpdate(ov, nv, bot, _) => handler.voice_update(ov, nv, bot).await,
             Event::BulkReactionDelete(ch, msg) => handler.bulk_reaction_delete(ch, msg).await,
+            Event::CacheReady(bot) => handler.cache_ready(bot).await,
         }
         Ok(())
     }
@@ -179,8 +180,12 @@ impl EventHandler {
 #[async_trait]
 impl SerenityEventHandler for EventHandler {
     async fn cache_ready(&self, ctx: Context, guilds: Vec<GuildId>) {
+        let event = Event::CacheReady(ctx.cache.current_user_id().await);
         for guild_id in guilds {
             self.replace_shard_sender(ctx.clone(), guild_id).await;
+            let s = self.clone();
+            let e = event.clone();
+            tokio::spawn(async move { EventHandler::handle_result(s.process(guild_id, e).await) });
         }
     }
 

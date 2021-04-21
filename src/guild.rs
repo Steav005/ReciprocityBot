@@ -14,16 +14,16 @@ use crate::guild::player_manager::{PlayerManager, PlayerMapError, PlayerRequest}
 use crate::guild::scheduler::GuildScheduler;
 use crate::lavalink_handler::LavalinkEvent;
 use crate::player::Playback;
-use crate::task_handle::DeleteMessageTask;
+use crate::task_handle::DeleteMessagePoolTask;
 use lavalink_rs::LavalinkClient;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serenity::model::event::ResumedEvent;
 use serenity::model::prelude::{Message, VoiceState};
 use serenity::FutureExt;
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 pub mod message_manager;
@@ -65,30 +65,18 @@ impl ReciprocityGuild {
                 player_manager,
                 search_messages,
                 main_message: Arc::new(RwLock::new(None)),
+                delete_pool: Arc::new(Mutex::new(Vec::new())),
             },
         };
-
-        tokio::spawn(Self::clear_messages(guild.0.clone()));
-        let cloned_guild = guild.clone();
-        tokio::spawn(async move { cloned_guild.check_main_message().await });
-        //tokio::spawn(async move {
-        //    cloned_guild
-        //        .main_message_error(MessageError::UnexpectedEnd())
-        //        .await
-        //});
 
         Ok(guild)
     }
 
     //Delete every irrelevant message
-    async fn clear_messages(ctx: Context){
-        //TODO hacky sleep abändern
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-
+    async fn clear_messages(ctx: Context) {
         info!("Starting clear_messages in {:?}", ctx.id);
         let bot = ctx.bots.get_any_guild_bot(&ctx.id).await;
-        let bot = match bot{
+        let bot = match bot {
             None => {
                 warn!("Could not get a Bot for Guild: {:?}", ctx.id);
                 return;
@@ -96,26 +84,52 @@ impl ReciprocityGuild {
             Some(bot) => bot,
         };
 
-        let mut i = 0;
-        while let Ok(mut msgs) = ctx.channel.messages(bot.http(), |b| b.limit(200)).await {
-            let s = ctx.main_message.read().await.as_ref().map(|(msg, _)| msg.message_id());
-            let msgs = msgs.drain(..).filter(|m| !Some(m.id).eq(&s));
-            let searches: Vec<_> = ctx.search_messages.read().await.values().copied().collect();
-            let msgs: Vec<_> = msgs.filter(|m| !searches.contains(&m.id)).collect();
-            if msgs.is_empty(){
+        let mut msgs = ctx.channel.messages(bot.http(), |b| b.limit(100)).await;
+        loop {
+            let last = if let Ok(mut msgs) = msgs {
+                let last = msgs.last().cloned();
+                let s = ctx
+                    .main_message
+                    .read()
+                    .await
+                    .as_ref()
+                    .map(|(msg, _)| msg.message_id());
+                let msgs = msgs.drain(..).filter(|m| !Some(m.id).eq(&s));
+                let searches: Vec<_> = ctx.search_messages.read().await.values().copied().collect();
+                let msgs: Vec<_> = msgs
+                    .filter(|m| {
+                        !searches
+                            .iter()
+                            .any(|(msg, _)| msg.map(|msg| m.id.eq(&msg)).unwrap_or(false))
+                    })
+                    .collect();
+                if msgs.is_empty() {
+                    return;
+                }
+                let mut msgs: Vec<_> = msgs.iter().map(|m| m.id).collect();
+
+                info!(
+                    "Attempting to delete {} Messages in Guild: {:?}",
+                    msgs.len(),
+                    ctx.id
+                );
+                ctx.delete_pool.lock().await.append(&mut msgs);
+                ctx.scheduler
+                    .process_enqueue(DeleteMessagePoolTask {
+                        channel: ctx.channel,
+                        pool: ctx.delete_pool.clone(),
+                    })
+                    .await
+                    .ok();
+                last.unwrap()
+            } else {
                 return;
-            }
-            info!("Attempting to delete {} Messages in Guild: {:?}", msgs.len(), ctx.id);
-            let del_res = ctx.channel.delete_messages(bot.http(), msgs).await;
-            if let Err(e) = del_res{
-                warn!("Bulk Message Delete Error: Guild: {:?}, Error: {:?}", ctx.id, e);
-            }
-            if i == 4{
-                return;
-            }
-            i += 1;
+            };
+            msgs = ctx
+                .channel
+                .messages(bot.http(), |b| b.limit(100).after(last))
+                .await;
         }
-        
     }
 }
 
@@ -134,20 +148,24 @@ impl GuildEventHandler for ReciprocityGuild {
         if !self.0.channel.eq(&message.channel_id) || self.0.bots.contains_id(&message.author.id) {
             return;
         }
-        info!(
-            "Received Message: {}, User: {}",
-            message.id, message.author.id
-        );
+        info!("Received Message: {}, {}", message.id, message.author.id);
 
-        //Delete Message
-        self.0
-            .scheduler
-            .process_enqueue(DeleteMessageTask {
-                channel: message.channel_id,
-                message: message.id,
-            })
-            .await
-            .ok();
+        //Delete Message with small delay
+        let msg_clone = message.id;
+        let ch_clone = message.channel_id;
+        let delete_pool_clone = self.0.delete_pool.clone();
+        let scheduler_clone = self.0.scheduler.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            delete_pool_clone.lock().await.push(msg_clone);
+            scheduler_clone
+                .process_enqueue(DeleteMessagePoolTask {
+                    channel: ch_clone,
+                    pool: delete_pool_clone,
+                })
+                .await
+                .ok();
+        });
 
         //Get user Voice Channel
         let voice_channel = match self
@@ -200,9 +218,12 @@ impl GuildEventHandler for ReciprocityGuild {
         };
 
         //Should the voice state have changed, exit and stop player
-        if !same_voice_state{
-            if let Err(e) = self.0.player_manager.leave(voice_channel).await{
-                warn!("Error leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e);
+        if !same_voice_state {
+            if let Err(e) = self.0.player_manager.leave(voice_channel).await {
+                warn!(
+                    "Error leaving. {:?}, {:?}, {:?}",
+                    self.0.id, voice_channel, e
+                );
             }
             return;
         }
@@ -237,7 +258,6 @@ impl GuildEventHandler for ReciprocityGuild {
         //If query was not a valid url
         let tracks = if Url::parse(&message.content).is_err() {
             //Get relevant stuff for the search message
-            let http = bot.http().clone();
             let requester = message.author;
             let shard = match self
                 .0
@@ -247,7 +267,7 @@ impl GuildEventHandler for ReciprocityGuild {
             {
                 None => {
                     warn!(
-                        "No Shard was found for Guild/Bot. Guild: {}, Bot: {}",
+                        "No Shard was found for Guild/Bot. {}, Bot: {}",
                         self.0.id,
                         bot.id()
                     );
@@ -257,15 +277,9 @@ impl GuildEventHandler for ReciprocityGuild {
             };
 
             //Run the search message for determining a track
-            let search_message_res = SearchMessage::search(
-                http,
-                songs,
-                requester,
-                message.content,
-                shard,
-                self.0.clone(),
-            )
-            .await;
+            let search_message_res =
+                SearchMessage::search(songs, requester, message.content, shard, self.0.clone())
+                    .await;
             match search_message_res {
                 Ok(track) => vec![track],
                 Err(e) => {
@@ -301,19 +315,33 @@ impl GuildEventHandler for ReciprocityGuild {
         }
 
         //Check Main Message
-        if let Some((msg, _)) = self.0.main_message.read().await.deref() {
+        let lock = self.0.main_message.read().await;
+        if let Some(msg) = lock.as_ref().map(|(m, _)| m.clone()) {
+            drop(lock);
             if msg.message_id() == message {
                 //Now check if the main message is alright
                 self.check_main_message().await;
                 return;
             }
+        } else {
+            drop(lock);
         }
 
         //Check Search Messages
-        let contains = self.0.search_messages.read().await.values().any(|msg| message.eq(msg));
+        let contains = self
+            .0
+            .search_messages
+            .read()
+            .await
+            .values()
+            .any(|(msg, _)| msg.map(|msg| msg.eq(&message)).unwrap_or(false));
         if contains {
             let mut search_lock = self.0.search_messages.write().await;
-            if let Some(user) = search_lock.iter().find(|(_, msg)| message.eq(*msg)).map(|(user, _)| *user){
+            if let Some(user) = search_lock
+                .iter()
+                .find(|(_, (msg, _))| msg.map(|msg| msg.eq(&message)).unwrap_or(false))
+                .map(|(user, _)| *user)
+            {
                 search_lock.remove(&user);
             }
             drop(search_lock);
@@ -336,12 +364,18 @@ impl GuildEventHandler for ReciprocityGuild {
             return;
         }
 
-        info!("Checking emotes, because main message emotes were bulk deleted. Guild: {:?}, Message: {:?}", self.0.id, message);
+        info!(
+            "Checking emotes, because main message emotes were bulk deleted. {:?}, {:?}",
+            self.0.id, message
+        );
         msg.clone().emote_check().await;
     }
 
-    async fn resume(&self, _time: Instant, _event: ResumedEvent) {
-        //TODO maybe do something, Ignore for the time being
+    async fn resume(&self, time: Instant, event: ResumedEvent) {
+        warn!("Resume event. {:?}, {:?}, {:?}", self.0.id, time, event);
+        tokio::spawn(Self::clear_messages(self.0.clone()));
+        let cloned_guild = self.clone();
+        tokio::spawn(async move { cloned_guild.check_main_message().await });
     }
 
     async fn voice_update(
@@ -354,7 +388,7 @@ impl GuildEventHandler for ReciprocityGuild {
         let voice_channel = match &old_voice_state {
             None => {
                 info!(
-                    "Ignoring Voice Update, because old one was None: Guild: {:?}",
+                    "Ignoring Voice Update, because old one was None. {:?}",
                     self.0.id
                 );
                 return;
@@ -362,7 +396,7 @@ impl GuildEventHandler for ReciprocityGuild {
             Some(st) => match st.channel_id {
                 None => {
                     info!(
-                        "Ignoring Voice Update, because old one was None: Guild: {:?}",
+                        "Ignoring Voice Update, because old one was None. {:?}",
                         self.0.id
                     );
                     return;
@@ -372,16 +406,22 @@ impl GuildEventHandler for ReciprocityGuild {
         };
 
         //Branch if moved user is our bot
-        match self.0.bots.contains_id(&new_voice_state.user_id){
+        match self.0.bots.contains_id(&new_voice_state.user_id) {
             true => {
                 //Only do something if the new_voice_state is a channel
                 if new_voice_state.channel_id.is_some() {
                     //And if the old voice state is not non
                     if let Some(old_vc) = old_voice_state {
                         if let Some(old_ch) = old_vc.channel_id {
-                            info!("Bot was moved. Guild: {:?}, Old Channel: {:?}, New Channel: {:?}, Bot: {:?}", self.0.id, old_ch, new_voice_state, &new_voice_state.user_id);
-                            if let Err(e) = self.0.player_manager.leave(old_ch).await{
-                                warn!("Error leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e);
+                            info!(
+                                "Bot was moved. {:?}, Old: {:?}, New: {:?}, Bot: {:?}",
+                                self.0.id, old_ch, new_voice_state, &new_voice_state.user_id
+                            );
+                            if let Err(e) = self.0.player_manager.leave(old_ch).await {
+                                warn!(
+                                    "Error leaving. {:?}, {:?}, {:?}",
+                                    self.0.id, voice_channel, e
+                                );
                             }
                         }
                     }
@@ -389,15 +429,29 @@ impl GuildEventHandler for ReciprocityGuild {
             }
             false => {
                 //Delete Search Message if it exists
-                let search = self.0.search_messages.write().await.remove(&new_voice_state.user_id);
-                if let Some(msg) = search{
-                    info!("Removing Search Message, because User left. Guild: {:?}, User: {:?}, Message: {:?}", self.0.id, new_voice_state.user_id, msg);
-                    let del_task = DeleteMessageTask{
-                        channel: self.0.channel,
-                        message: msg
-                    };
-                    if let Err(e) = self.0.scheduler.process_enqueue(del_task).await {
-                        warn!("Error queueing Search Message delete Task. Guild: {:?}, Message: {:?}, Error: {:?}", self.0.id, msg, e);
+                let search = self
+                    .0
+                    .search_messages
+                    .write()
+                    .await
+                    .remove(&new_voice_state.user_id);
+                if let Some((msg, _)) = search {
+                    info!(
+                        "Removing Search Message, because User left. {:?}, {:?}, {:?}",
+                        self.0.id, new_voice_state.user_id, msg
+                    );
+                    if let Some(msg) = msg {
+                        self.0.delete_pool.lock().await.push(msg);
+                        let del_task = DeleteMessagePoolTask {
+                            channel: self.0.channel,
+                            pool: self.0.delete_pool.clone(),
+                        };
+                        if let Err(e) = self.0.scheduler.process_enqueue(del_task).await {
+                            warn!(
+                                "Error queueing Search Message delete Task. {:?}, {:?}, {:?}",
+                                self.0.id, msg, e
+                            );
+                        }
                     }
                 }
 
@@ -411,7 +465,7 @@ impl GuildEventHandler for ReciprocityGuild {
                     None => return,
                     Some(in_channel) => {
                         if in_channel {
-                            info!("Ignoring Leave, because there are still user in the channel: Guild: {:?}, Channel: {:?}", self.0.id, voice_channel);
+                            info!("Ignoring Leave, because there are still user in the channel. {:?}, {:?}", self.0.id, voice_channel);
                             return;
                         }
                     }
@@ -419,16 +473,21 @@ impl GuildEventHandler for ReciprocityGuild {
 
                 let leave_res = self.0.player_manager.leave(voice_channel).await;
                 match leave_res {
-                    Ok(_) => info!("Successfully left Channel, due to users leaving. Guild: {:?}, Channel: {:?}", self.0.id, voice_channel),
-                    Err(e) => warn!("Error leaving Channel, due to users leaving. Guild: {:?}, Channel: {:?}, Error: {:?}", self.0.id, voice_channel, e),
+                    Ok(_) => info!(
+                        "Successfully left Channel, due to users leaving. {:?}, {:?}",
+                        self.0.id, voice_channel
+                    ),
+                    Err(e) => warn!(
+                        "Error leaving Channel, due to users leaving. {:?}, {:?}, {:?}",
+                        self.0.id, voice_channel, e
+                    ),
                 }
             }
         }
-
     }
 
     async fn lavalink(&self, event: LavalinkEvent, client: LavalinkClient) {
-        info!("Lavaplayer Event: {:?}", &event);
+        debug!("Lavaplayer Event: {:?}", &event);
         self.0
             .player_manager
             .handle_player_event(event, client)
@@ -436,20 +495,9 @@ impl GuildEventHandler for ReciprocityGuild {
             .ok();
     }
 
-    //async fn main_message_error(&self, error: MessageError) {
-    //    warn!("Main Message Error occurred. Guild: {:?}, Error: {:?}", self.0.id, error);
-    //
-    //    while let Err(e) = MainMessage::new(self.clone(), self.0.clone())
-    //        .await
-    //    {
-    //        warn!("Error creating Main Message. Reattempting in 5 sec. Guild: {:?}, Error: {:?}", self.0.id, e);
-    //        tokio::time::sleep(Duration::from_secs(5)).await;
-    //    }
-    //}
-
     async fn main_message_event(&self, event: EmoteAction, user: UserId) {
         info!(
-            "Main Message Event occurred. Guild: {:?}, User: {:?}, Event: {:?}",
+            "Main Message Event occurred. {:?}, {:?}, {:?}",
             self.0.id, user, event
         );
 
@@ -457,14 +505,17 @@ impl GuildEventHandler for ReciprocityGuild {
         let voice_channel = match self.0.bots.get_user_voice_state(&user, &self.0.id).await {
             None => {
                 info!(
-                    "Ignoring Event because User is not in Voice Channel. Guild: {:?}. User: {:?}",
+                    "Ignoring Event because User is not in Voice Channel. {:?}. {:?}",
                     self.0.id, user
                 );
                 return;
             }
             Some(st) => match st.channel_id {
                 None => {
-                    info!("Ignoring Event because User is not in Voice Channel. Guild: {:?}. User: {:?}", self.0.id, user);
+                    info!(
+                        "Ignoring Event because User is not in Voice Channel. {:?}. {:?}",
+                        self.0.id, user
+                    );
                     return;
                 }
                 Some(ch) => ch,
@@ -480,11 +531,17 @@ impl GuildEventHandler for ReciprocityGuild {
                 let join_res = self.0.player_manager.join(voice_channel).await;
                 match join_res {
                     Ok(_) => {
-                        info!("Successfully joined Voice Channel. Guild: {:?}, Channel: {:?}, User: {:?}", self.0.id, voice_channel, user);
+                        info!(
+                            "Successfully joined Voice Channel. {:?}, {:?}, {:?}",
+                            self.0.id, voice_channel, user
+                        );
                         return;
                     }
                     Err(e) => {
-                        warn!("Error joining Voice Channel. Guild: {:?}, Channel: {:?}, User: {:?}, Error: {:?}", self.0.id, voice_channel, user, e);
+                        warn!(
+                            "Error joining Voice Channel. {:?}, {:?}, {:?}, {:?}",
+                            self.0.id, voice_channel, user, e
+                        );
                         return;
                     }
                 }
@@ -493,11 +550,17 @@ impl GuildEventHandler for ReciprocityGuild {
                 let join_res = self.0.player_manager.leave(voice_channel).await;
                 match join_res {
                     Ok(_) => {
-                        info!("Successfully left Voice Channel. Guild: {:?}, Channel: {:?}, User: {:?}", self.0.id, voice_channel, user);
+                        info!(
+                            "Successfully left Voice Channel. {:?}, {:?}, {:?}",
+                            self.0.id, voice_channel, user
+                        );
                         return;
                     }
                     Err(e) => {
-                        warn!("Error leaving Voice Channel. Guild: {:?}, Channel: {:?}, User: {:?}, Error: {:?}", self.0.id, voice_channel, user, e);
+                        warn!(
+                            "Error leaving Voice Channel. {:?}, {:?}, {:?}, {:?}",
+                            self.0.id, voice_channel, user, e
+                        );
                         return;
                     }
                 }
@@ -507,7 +570,7 @@ impl GuildEventHandler for ReciprocityGuild {
             EmoteAction::LoopAll() => PlayerRequest::Playback(Playback::AllLoop, voice_channel),
             _ => {
                 info!(
-                    "Received unexpected Event. Guild: {:?}, User: {:?}, Event: {:?}",
+                    "Received unexpected Event. {:?}, {:?}, {:?}",
                     self.0.id, user, event
                 );
                 return;
@@ -518,36 +581,45 @@ impl GuildEventHandler for ReciprocityGuild {
         let request_res = self.0.player_manager.request(request).await;
         if let Err(e) = request_res {
             warn!(
-                "Error Handling User Request. Guild: {:?}, User: {:?}, Event: {:?}, Error: {:?}",
+                "Error Handling User Request. {:?}, {:?}, {:?}, {:?}",
                 self.0.id, user, event, e
             );
         }
     }
 
     async fn check_main_message(&self) {
-        info!("Start Main Message Check. Guild: {:?}", self.0.id);
+        info!("Start Main Message Check. {:?}", self.0.id);
         let mut message_lock = self.0.main_message.write().await;
 
         if let Some((msg, handle)) = message_lock.deref().borrow() {
             if msg.message_still_exists().await {
+                info!("Main Message still exists. {:?}", self.0.id);
                 return;
             } else {
                 //Make sure Message is really gone
                 info!(
-                    "Making sure, Main Message is really gone. Guild: {:?}, Message: {:?}",
+                    "Making sure, Main Message is really gone. {:?}, {:?}",
                     self.0.id,
                     msg.message_id()
                 );
-                let task = DeleteMessageTask {
+                self.0.delete_pool.lock().await.push(msg.message_id());
+                let task = DeleteMessagePoolTask {
                     channel: msg.channel_id(),
-                    message: msg.message_id(),
+                    pool: self.0.delete_pool.clone(),
                 };
                 let del_res = self.0.scheduler.process_enqueue(task).await;
                 if let Err(e) = del_res {
-                    warn!("Error queueing Main Message delete Task. Guild: {:?}, Message: {:?}, Error: {:?}", self.0.id, msg.message_id(), e);
+                    warn!(
+                        "Error queueing Main Message delete Task. {:?}, {:?}, {:?}",
+                        self.0.id,
+                        msg.message_id(),
+                        e
+                    );
                 }
                 handle.abort();
             }
+        } else {
+            warn!("Main Message was empty. {:?}", self.0.id);
         }
 
         loop {
@@ -555,7 +627,7 @@ impl GuildEventHandler for ReciprocityGuild {
             match msg_res {
                 Ok((msg, run)) => {
                     info!(
-                        "Created new Main Message. Guild: {:?}, Message: {:?}",
+                        "Created new Main Message. {:?}, {:?}",
                         self.0.id,
                         msg.message_id()
                     );
@@ -565,10 +637,20 @@ impl GuildEventHandler for ReciprocityGuild {
                     return;
                 }
                 Err(e) => {
-                    warn!("Error creating Main Message. Reattempting in 5 sec. Guild: {:?}, Error: {:?}", self.0.id, e);
+                    warn!(
+                        "Error creating Main Message. Reattempting in 5 sec. {:?}, {:?}",
+                        self.0.id, e
+                    );
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
+    }
+
+    async fn cache_ready(&self, bot: UserId) {
+        info!("Cache Ready. {:?}, Bot: {:?}", self.0.id, bot);
+        tokio::spawn(Self::clear_messages(self.0.clone()));
+        let cloned_guild = self.clone();
+        tokio::spawn(async move { cloned_guild.check_main_message().await });
     }
 }

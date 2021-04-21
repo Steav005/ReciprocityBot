@@ -60,10 +60,7 @@ impl PlayerManager {
     }
 
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
-        info!(
-            "Handling Player Request. Guild: {:?}, Request: {:?}",
-            self.guild, request
-        );
+        info!("Handling Player Request. {:?}, {:?}", self.guild, request);
         let player = self
             .player
             .read()
@@ -132,10 +129,7 @@ impl PlayerManager {
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
-        info!(
-            "Handling Join Request. Guild: {:?}, channel: {:?}",
-            self.guild, channel
-        );
+        info!("Handling Join Request. {:?}, {:?}", self.guild, channel);
         let mut bot_vec = self
             .player
             .read()
@@ -151,17 +145,14 @@ impl PlayerManager {
                 match &result {
                     Ok(_) => return result,
                     Err(e) => warn!(
-                        "Join Attempt Failed. Guild: {:?}, Channel: {:?}, Error: {:?}",
+                        "Join Attempt Failed. {:?}, {:?}, {:?}",
                         self.guild, channel, e
                     ),
                 }
             }
         }
 
-        info!(
-            "Failed Join Request. Guild: {:?}, channel: {:?}",
-            self.guild, channel
-        );
+        info!("Failed Join Request. {:?}, {:?}", self.guild, channel);
         Err(PlayerMapError::NoFreeBot())
     }
 
@@ -210,7 +201,7 @@ impl PlayerManager {
 
     pub async fn leave(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
         info!(
-            "Attempt Voice Channel Leave. Guild: {:?}, Channel: {:?}",
+            "Attempt Voice Channel Leave. {:?}, {:?}",
             self.guild, channel
         );
         //Get bot and player while removing channel and lavalink form the HashMap
@@ -232,7 +223,7 @@ impl PlayerManager {
             .await;
         if let Err(e) = disconnect_res {
             warn!(
-                "Error processing player disconnect. Guild: {:?}, Channel: {:?}, Error: {:?}",
+                "Error processing player disconnect. {:?}, {:?}, {:?}",
                 self.guild, channel, e
             );
         }

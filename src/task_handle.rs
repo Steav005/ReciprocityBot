@@ -1,16 +1,21 @@
-use log::{debug, error};
-use serde_json::Value;
+use crate::context::SearchMessageId;
+use log::{debug, error, warn};
 use serenity::async_trait;
 use serenity::http::routing::Route;
 use serenity::http::Http;
-use serenity::model::prelude::{ChannelId, GuildId, MessageId, ReactionType, UserId};
+use serenity::model::prelude::{ChannelId, GuildId, Message, MessageId, ReactionType, UserId};
 use serenity::prelude::SerenityError;
+use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use strum_macros::{EnumCount as EnumCountMacro, EnumIter};
 use thiserror::Error;
 use tokio::sync::oneshot::{Receiver as OneShotReceiver, Sender as OneShotSender};
+use tokio::sync::watch::Sender as WatchSender;
+use tokio::sync::{Mutex, RwLock};
+use uuid::Uuid;
 
 type PinedTask = Pin<Box<dyn Task>>;
 
@@ -89,6 +94,7 @@ pub enum TaskRoute {
     ChannelMessageReaction,
     ChannelMessage,
     ChannelMessageReactionSelf,
+    ChannelMessagesBulkDelete,
 }
 
 impl TaskRoute {
@@ -99,12 +105,14 @@ impl TaskRoute {
             TaskRoute::ChannelMessageReactionSelf => {
                 Route::ChannelsIdMessagesIdReactionsUserIdType(channel.0)
             }
+
+            TaskRoute::ChannelMessagesBulkDelete => Route::ChannelsIdMessagesBulkDelete(channel.0),
         }
     }
 }
 
 #[async_trait]
-pub trait Task: Send + Sync + Unpin + Debug {
+pub trait Task: Send + Sync + Unpin + Debug + Any {
     async fn run(&mut self, client: Arc<Http>) -> Result<(), SerenityError>;
 
     fn route(&self) -> TaskRoute;
@@ -137,19 +145,42 @@ impl Task for DeleteMessageReactionTask {
 }
 
 #[derive(Debug)]
-pub struct DeleteMessageTask {
+pub struct DeleteMessagePoolTask {
     pub channel: ChannelId,
-    pub message: MessageId,
+    pub pool: Arc<Mutex<Vec<MessageId>>>,
 }
 
 #[async_trait]
-impl Task for DeleteMessageTask {
+impl Task for DeleteMessagePoolTask {
     async fn run(&mut self, client: Arc<Http>) -> Result<(), SerenityError> {
-        client.delete_message(self.channel.0, self.message.0).await
+        let mut pool: Vec<_> = self.pool.lock().await.drain(..).collect();
+        if pool.is_empty() {
+            return Ok(());
+        }
+
+        loop {
+            let rem = pool.len();
+            if rem == 1 {
+                return self
+                    .channel
+                    .delete_message(client, pool.first().unwrap())
+                    .await;
+            }
+            if rem <= 100 {
+                return self.channel.delete_messages(&client, pool.drain(..)).await;
+            }
+            let res = self
+                .channel
+                .delete_messages(&client, pool.drain(..100))
+                .await;
+            if let Err(e) = res {
+                warn!("Error Bulk deleting. {:?}, {:?}", self.channel, e);
+            }
+        }
     }
 
     fn route(&self) -> TaskRoute {
-        TaskRoute::ChannelMessage
+        TaskRoute::ChannelMessagesBulkDelete
     }
 }
 
@@ -174,18 +205,34 @@ impl Task for AddMessageReactionTask {
 }
 
 #[derive(Debug)]
-pub struct SendDmTask {
-    channel: ChannelId,
-    text: String,
+pub struct SendSearchMessage {
+    pub channel: ChannelId,
+    pub text: String,
+    pub uuid: Uuid,
+    pub search_messages: Arc<RwLock<HashMap<UserId, SearchMessageId>>>,
+    pub callback: WatchSender<Option<Message>>,
 }
 
 #[async_trait]
-impl Task for SendDmTask {
+impl Task for SendSearchMessage {
     async fn run(&mut self, client: Arc<Http>) -> Result<(), SerenityError> {
-        client
-            .send_message(self.channel.0, &Value::String(self.text.clone()))
+        let relevant = self
+            .search_messages
+            .read()
             .await
-            .map(|_| ())
+            .values()
+            .any(|(_, u)| self.uuid.eq(u));
+        if !relevant {
+            return Ok(());
+        }
+        let msg = self
+            .channel
+            .send_message(client, |m| m.content(self.text.clone()))
+            .await;
+        if let Ok(msg) = &msg {
+            self.callback.send(Some(msg.clone())).ok();
+        }
+        msg.map(|_| ())
     }
 
     fn route(&self) -> TaskRoute {

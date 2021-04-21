@@ -27,6 +27,9 @@ tokio-stream = "^0"
 rand = "^0"
 clap = "^2"
 url = "^2"
+uuid = { version = "^0", features = ["v4"] }
+serde-diff = "^0"
+log4rs = "^1"
 
 tokio = { version = "^1", features = ["rt-multi-thread", "time", "sync", "net"] }
 serenity = { version = "^0", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}

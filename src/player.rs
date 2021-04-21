@@ -135,6 +135,7 @@ impl Player {
 
     pub async fn back_skip(&mut self) -> Result<(), PlayerError> {
         let mut changed = false;
+        let mut current_was_some = false;
 
         if let Some((_, track)) = self.player_state.current.take() {
             if self.player_state.playlist.is_full() {
@@ -148,6 +149,7 @@ impl Player {
                 .push_front(track)
                 .expect("Playlist is full");
             changed = true;
+            current_was_some = true;
         }
 
         if let Some(history_track) = self.player_state.history.pop_back() {
@@ -167,10 +169,14 @@ impl Player {
         if changed {
             self.send.send(Arc::new(self.player_state.clone())).ok();
         }
-        self.lavalink
-            .stop(self.guild)
-            .await
-            .map_err(PlayerError::Lavalink)
+        if current_was_some {
+            self.lavalink
+                .stop(self.guild)
+                .await
+                .map_err(PlayerError::Lavalink)
+        } else {
+            self.play_next().await
+        }
     }
 
     pub async fn enqueue(
@@ -322,11 +328,9 @@ impl Player {
         let now = Instant::now();
         let new_pos = Duration::from_millis(update.state.position as u64);
         if let Some(((pos, when), _)) = self.player_state.current.borrow_mut() {
-            if pos.as_secs() != new_pos.as_secs() {
-                *pos = new_pos;
-                *when = now;
-                self.send.send(Arc::new(self.player_state.clone())).ok();
-            }
+            *pos = new_pos;
+            *when = now;
+            self.send.send(Arc::new(self.player_state.clone())).ok();
         }
     }
 
@@ -339,10 +343,19 @@ impl Player {
     }
 }
 
-#[derive(Copy, Clone, Debug, AsRefStr)]
+#[derive(Copy, Clone, Debug, AsRefStr, Eq, PartialEq)]
 pub enum PlayState {
     Play,
     Pause,
+}
+
+impl Display for PlayState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlayState::Play => Ok(()),
+            PlayState::Pause => write!(f, "Paused "),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]

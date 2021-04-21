@@ -13,10 +13,12 @@ use serenity::model::prelude::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 pub type MainMessageData = (MainMessage, JoinHandle<()>);
+pub type SearchMessageId = (Option<MessageId>, Uuid);
 
 #[derive(Clone)]
 pub struct Context {
@@ -27,8 +29,9 @@ pub struct Context {
     pub config: Arc<Config>,
     pub scheduler: GuildScheduler,
     pub player_manager: Arc<PlayerManager>,
-    pub search_messages: Arc<RwLock<HashMap<UserId, MessageId>>>,
+    pub search_messages: Arc<RwLock<HashMap<UserId, SearchMessageId>>>,
     pub main_message: Arc<RwLock<Option<MainMessageData>>>,
+    pub delete_pool: Arc<Mutex<Vec<MessageId>>>,
 }
 
 #[async_trait]
@@ -64,4 +67,7 @@ pub trait GuildEventHandler: Send + Sync {
 
     /// When the Main Message might be missing
     async fn check_main_message(&self);
+
+    /// When the Cache for a Bot is ready
+    async fn cache_ready(&self, bot: UserId);
 }

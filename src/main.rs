@@ -6,10 +6,24 @@ use reciprocity_bot::{ReciprocityBot, ReciprocityError};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+//use log::LevelFilter;
+//use log4rs::append::file::FileAppender;
+//use log4rs::encode::pattern::PatternEncoder;
+//use log4rs::config::{Appender, Root};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("RUST_LOG", "reciprocity_bot=info,reciprocity_bot=debug");
     tracing_subscriber::fmt::init();
+
+    //let logfile = FileAppender::builder()
+    //    .encoder(Box::new(PatternEncoder::new("{l} - {m}\n")))
+    //    .build("log/output.log").unwrap();
+    //let config = log4rs::Config::builder()
+    //    .appender(Appender::builder().build("logfile", Box::new(logfile)))
+    //    .build(Root::builder()
+    //        .appender("logfile")
+    //        .build(LevelFilter::Info))?;
+    //log4rs::init_config(config).unwrap();
 
     let matches = App::new("ReciprocityBot")
         .version(env!("CARGO_PKG_VERSION"))

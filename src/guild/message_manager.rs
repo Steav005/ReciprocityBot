@@ -1,13 +1,15 @@
 use crate::bots::Bot;
 use crate::context::{Context, GuildEventHandler};
 use crate::guild::ReciprocityGuild;
-use crate::task_handle::{AddMessageReactionTask, DeleteMessageReactionTask, DeleteMessageTask};
+use crate::player::PlayState;
+use crate::task_handle::{
+    AddMessageReactionTask, DeleteMessagePoolTask, DeleteMessageReactionTask, SendSearchMessage,
+};
 use futures::{Future, FutureExt};
 use lavalink_rs::model::Track;
-use log::{info, warn};
+use log::{debug, info, warn};
 use serenity::client::bridge::gateway::ShardMessenger;
 use serenity::collector::ReactionAction;
-use serenity::http::Http;
 use serenity::model::prelude::{
     ChannelId, GuildId, Message, MessageId, Reaction, ReactionType, User, UserId,
 };
@@ -23,6 +25,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 const DELETE_MESSAGE_DELAY: Duration = Duration::from_millis(500);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -33,6 +36,7 @@ const MESSAGE_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 async fn add_emotes(
     context: Context,
     message: MessageId,
+    uuid: Uuid,
     requester: UserId,
     emotes: Arc<Vec<EmoteAction>>,
 ) {
@@ -41,9 +45,9 @@ async fn add_emotes(
         message,
         reaction: emote.reaction(),
     }) {
-        if let Some(msg) = context.search_messages.read().await.get(&requester) {
-            if !message.eq(msg) {
-                warn!("Stop Adding Emotes, because Search Message is no longer relevant. Guild: {:?}, Message: {:?}", context.id, message);
+        if let Some((_, id)) = context.search_messages.read().await.get(&requester) {
+            if !uuid.eq(id) {
+                warn!("Stop Adding Emotes, because Search Message is no longer relevant. {:?}, {:?}, {:?}", context.id, message, uuid);
                 return;
             }
         }
@@ -51,7 +55,7 @@ async fn add_emotes(
         //Add single emote and wait for completion
         if let Err(e) = context.scheduler.process(task).await {
             warn!(
-                "Error Adding Emote to Search Message: {:?}, Error: {:?}",
+                "Error Adding Emote to Search Message: {:?}, {:?}",
                 message, e
             );
         }
@@ -62,36 +66,86 @@ pub struct SearchMessage;
 
 impl SearchMessage {
     pub async fn search(
-        bot: Arc<Http>,
         tracks: Vec<Track>,
         requester: User,
         query: String,
         shard_messenger: impl AsRef<ShardMessenger>,
         context: Context,
     ) -> Result<Track, MessageError> {
+        let uuid = Uuid::new_v4();
         info!(
-            "New Search Message. Guild: {:?}, User: {:?}, Query: {:?}",
-            context.id, requester.id, query
+            "New Search Message. {:?}, {:?}, {:?}, Query: {:?}",
+            context.id, requester.id, uuid, query
         );
-        let message = context
-            .channel
-            .send_message(bot, |m| {
-                m.content(Self::content(tracks.as_slice(), &query, &requester))
-            })
-            .await
-            .map_err(MessageError::SerenityError)?;
 
-        //Delete old message and add new id to the message map
+        //Replace old Search Message
         let mut messages_lock = context.search_messages.write().await;
-        if let Some(old_id) = messages_lock.insert(requester.id, message.id) {
-            let task = DeleteMessageTask {
+        if let Some((Some(old_msg), _)) = messages_lock.insert(requester.id, (None, uuid)) {
+            context.delete_pool.lock().await.push(old_msg);
+            let task = DeleteMessagePoolTask {
                 channel: context.channel,
-                message: old_id,
+                pool: context.delete_pool.clone(),
             };
             drop(messages_lock);
             context.scheduler.process_enqueue(task).await.ok();
         } else {
             drop(messages_lock);
+        }
+
+        //Attempt sending search message
+        let (send, mut rec_msg) = tokio::sync::watch::channel(None);
+        context
+            .scheduler
+            .process_enqueue(SendSearchMessage {
+                channel: context.channel,
+                text: Self::content(tracks.as_slice(), &query, &requester),
+                uuid,
+                search_messages: context.search_messages.clone(),
+                callback: send,
+            })
+            .await
+            .ok();
+        let message = if rec_msg.changed().await.is_ok() {
+            if let Some(msg) = rec_msg.borrow().deref() {
+                msg.clone()
+            } else {
+                info!(
+                    "Search Message became irrelevant: {:?}, {:?}",
+                    context.id, uuid
+                );
+                return Err(MessageError::Deleted());
+            }
+        } else {
+            info!("Search Message Sender Ended: {:?}, {:?}", context.id, uuid);
+            return Err(MessageError::Deleted());
+        };
+
+        //Insert new message Id, or delete message if uuid changed inside map
+        let mut lock = context.search_messages.write().await;
+        if lock
+            .get(&requester.id)
+            .map(|(_, id)| uuid.eq(id))
+            .unwrap_or(false)
+        {
+            let (msg, _) = lock.get_mut(&requester.id).unwrap();
+            *msg = Some(message.id);
+            drop(lock);
+        } else {
+            drop(lock);
+
+            info!(
+                "Search Message became irrelevant: {:?}, {:?}",
+                context.id, uuid
+            );
+            //Delete this Message
+            context.delete_pool.lock().await.push(message.id);
+            let task = DeleteMessagePoolTask {
+                channel: context.channel,
+                pool: context.delete_pool.clone(),
+            };
+            context.scheduler.process_enqueue(task).await.ok();
+
+            return Err(MessageError::Deleted());
         }
 
         //Build emotes, that we are using with this message
@@ -125,24 +179,26 @@ impl SearchMessage {
         tokio::spawn(add_emotes(
             context.clone(),
             message.id,
+            uuid,
             requester.id,
             emotes_1.clone(),
         ));
         let track: Result<Track, MessageError> = collector.await.ok_or(MessageError::Timeout());
 
+        context.delete_pool.lock().await.push(message.id);
         context
             .scheduler
-            .process_enqueue(DeleteMessageTask {
+            .process_enqueue(DeleteMessagePoolTask {
                 channel: context.channel,
-                message: message.id,
+                pool: context.delete_pool.clone(),
             })
             .await
             .ok();
 
         //Remove message id if message is still in map
         let mut messages_lock = context.search_messages.write().await;
-        if let Some(msg) = messages_lock.get(&requester.id){
-            if message.id.eq(msg){
+        if let Some((_, id)) = messages_lock.get(&requester.id) {
+            if uuid.eq(id) {
                 messages_lock.remove(&requester.id);
             }
         }
@@ -198,7 +254,7 @@ impl MainMessage {
         guild: ReciprocityGuild,
         context: Context,
     ) -> Result<(Self, impl Future<Output = ()>), MessageError> {
-        info!("Start new Main Message. Guild: {:?}", context.id);
+        info!("Start new Main Message. {:?}", context.id);
         let bot = context
             .bots
             .get_any_guild_bot(&context.id)
@@ -238,7 +294,7 @@ impl MainMessage {
             .await;
 
         info!(
-            "Starting Message Collector for Main Message: {:?}, Guild: {:?}",
+            "Starting Message Collector for Main Message: {:?}, {:?}",
             self.message.id, self.context.id
         );
         while let Some(reaction) = collector.next().await {
@@ -279,6 +335,8 @@ impl MainMessage {
                     if let Some(user) = &reaction.user_id {
                         if self.context.bots.contains_id(user) {
                             tokio::spawn(self.clone().rebuild_emotes());
+                        } else {
+                            tokio::spawn(self.clone().emote_check());
                         }
                     } else {
                         // Check Message
@@ -314,17 +372,14 @@ impl MainMessage {
             if message.content.eq(content.as_str()) {
                 continue;
             }
-            info!(
-                "Updating Message: {:?}, Guild: {:?}",
-                message.id, self.context.id
-            );
+            debug!("Updating Message: {:?}, {:?}", message.id, self.context.id);
             let edit_res = message
                 .edit(self.bot.cache_http(), |msg| msg.content(content))
                 .await;
             if let Err(e) = edit_res {
                 //BREAK Update Loop if error occurred
                 warn!(
-                    "Error updating Message: {:?}, Guild: {:?}, Error: {:?}",
+                    "Error updating Message: {:?},  {:?}, {:?}",
                     message.id, self.context.id, e
                 );
                 return;
@@ -344,7 +399,10 @@ impl MainMessage {
         {
             Ok(msg) => msg,
             Err(e) => {
-                warn!("Error getting Message for emote check. Guild: {:?}, Message: {:?}, Error: {:?}", self.context.id, self.message.id, e);
+                warn!(
+                    "Error getting Message for emote check.  {:?}, {:?}, {:?}",
+                    self.context.id, self.message.id, e
+                );
                 return;
             }
         };
@@ -368,7 +426,7 @@ impl MainMessage {
         let delete_all_res = msg.delete_reactions(self.bot.cache_http()).await;
         if let Err(e) = delete_all_res {
             warn!(
-                "Error deleting Reactions for Message: {:?}, Error: {:?}",
+                "Error deleting Reactions for Message: {:?}, {:?}",
                 msg.id, e
             );
             return;
@@ -383,10 +441,7 @@ impl MainMessage {
             };
             let add_res = self.context.scheduler.process(task).await;
             if let Err(e) = add_res {
-                warn!(
-                    "Error adding Reaction to Message: {:?}, Error: {:?}",
-                    msg.id, e
-                );
+                warn!("Error adding Reaction to Message: {:?}, {:?}", msg.id, e);
                 return;
             }
         }
@@ -401,7 +456,7 @@ impl MainMessage {
         let delete_all_res = self.message.delete_reactions(self.bot.cache_http()).await;
         if let Err(e) = delete_all_res {
             warn!(
-                "Error deleting Reactions for Message: {:?}, Error: {:?}",
+                "Error deleting Reactions for Message: {:?}, {:?}",
                 self.message.id, e
             );
             return;
@@ -417,7 +472,7 @@ impl MainMessage {
             let add_res = self.context.scheduler.process(task).await;
             if let Err(e) = add_res {
                 warn!(
-                    "Error adding Reaction to Message: {:?}, Error: {:?}",
+                    "Error adding Reaction to Message: {:?}, {:?}",
                     self.message.id, e
                 );
                 return;
@@ -454,9 +509,21 @@ impl MainMessage {
                     if state.current.is_none() && state.playlist.is_empty() {
                         write!(msg, " No Song in Playlist\r\n").unwrap();
                     } else {
-                        write!(msg, " {}\r\n", state.playback.to_string()).unwrap();
+                        write!(
+                            msg,
+                            " {}{}\r\n",
+                            state.play_state.to_string(),
+                            state.playback.to_string()
+                        )
+                        .unwrap();
                     }
 
+                    //For not adding elapsed value if the player is paused
+                    let elapse_mult = if state.play_state == PlayState::Play {
+                        1
+                    } else {
+                        0
+                    };
                     if let Some(((dur, when), cur)) = &state.current {
                         write!(
                             msg,
@@ -465,7 +532,7 @@ impl MainMessage {
                             cur.info
                                 .clone()
                                 .map_or("No Track Name".to_string(), |i| i.title),
-                            Self::duration_fmt(&(when.elapsed() + *dur)),
+                            Self::duration_fmt(&((when.elapsed() * elapse_mult) + *dur)),
                             cur.info
                                 .clone()
                                 .map_or("--:--".to_string(), |i| Self::duration_fmt(
@@ -514,6 +581,8 @@ pub enum MessageError {
     Timeout(),
     #[error("Unexpectedly ended")]
     UnexpectedEnd(),
+    #[error("Message became obsolete and was deleted")]
+    Deleted(),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
