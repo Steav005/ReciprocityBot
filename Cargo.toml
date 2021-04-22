@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 arrayvec = "^0"
 log = "^0"
+simple-logging = "^2"
 tracing = "^0"
 tracing-subscriber = "^0"
 futures = "^0"
@@ -29,9 +30,10 @@ clap = "^2"
 url = "^2"
 uuid = { version = "^0", features = ["v4"] }
 serde-diff = "^0"
-log4rs = "^1"
 
 tokio = { version = "^1", features = ["rt-multi-thread", "time", "sync", "net"] }
 serenity = { version = "^0", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
 songbird = { version = "^0", default-features = false, features = ["serenity-rustls", "gateway"]}
 lavalink-rs = { git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}
+#reciprocity_communication = {path = "../reciprocity_communication", features = ["host"]}
+reciprocity_communication = {git = "https://github.com/Steav005/reciprocity_communication", branch = "master", features = ["host"]}

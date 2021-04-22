@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct TripleHashMap<KM, K1, K2, V>
 where
     KM: Hash + Eq + Clone,

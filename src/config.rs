@@ -2,12 +2,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::net::Ipv4Addr;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub bots: HashMap<String, String>,
     pub guilds: HashMap<String, GuildConfig>,
     pub lavalink: LavalinkConfig,
+    pub net: Option<NetConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NetConfig{
+    pub address: Ipv4Addr,
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

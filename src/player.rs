@@ -109,10 +109,33 @@ impl Player {
         }
     }
 
-    pub async fn skip(&mut self) -> Result<(), PlayerError> {
+    pub async fn skip(&mut self, i: usize) -> Result<(), PlayerError> {
+        //Leave if skip amount is 0
+        if i == 0{
+            return Ok(())
+        }
+
+        let mut changed = false;
+
         //If loop is one, move the current track to history, so a new Track gets played
-        if let Playback::OneLoop = self.player_state.playback {
-            if let Some((_, track)) = self.player_state.current.take() {
+        //if let Playback::OneLoop = self.player_state.playback {
+        if let Some((_, track)) = self.player_state.current.take() {
+            if self.player_state.history.is_full() {
+                self.player_state
+                    .history
+                    .pop_back()
+                    .expect("History is empty");
+            }
+            self.player_state
+                .history
+                .push_front(track)
+                .expect("History is full");
+            changed = true;
+        }
+        //}
+
+        for _i in 0..i-1{
+            if let Some(track) = self.player_state.history.pop_front(){
                 if self.player_state.history.is_full() {
                     self.player_state
                         .history
@@ -123,8 +146,13 @@ impl Player {
                     .history
                     .push_front(track)
                     .expect("History is full");
-                self.send.send(Arc::new(self.player_state.clone())).ok();
+            } else {
+                break;
             }
+        }
+
+        if changed{
+            self.send.send(Arc::new(self.player_state.clone())).ok();
         }
 
         self.lavalink
@@ -133,7 +161,11 @@ impl Player {
             .map_err(PlayerError::Lavalink)
     }
 
-    pub async fn back_skip(&mut self) -> Result<(), PlayerError> {
+    pub async fn back_skip(&mut self, i: usize) -> Result<(), PlayerError> {
+        if i == 0{
+            return Ok(())
+        }
+
         let mut changed = false;
         let mut current_was_some = false;
 
@@ -152,18 +184,20 @@ impl Player {
             current_was_some = true;
         }
 
-        if let Some(history_track) = self.player_state.history.pop_back() {
-            if self.player_state.playlist.is_full() {
+        for _i in 0..i {
+            if let Some(history_track) = self.player_state.history.pop_back() {
+                if self.player_state.playlist.is_full() {
+                    self.player_state
+                        .playlist
+                        .pop_back()
+                        .expect("Playlist is empty");
+                }
                 self.player_state
                     .playlist
-                    .pop_back()
-                    .expect("Playlist is empty");
+                    .push_front(history_track)
+                    .expect("Playlist is full");
+                changed = true;
             }
-            self.player_state
-                .playlist
-                .push_front(history_track)
-                .expect("Playlist is full");
-            changed = true;
         }
 
         if changed {
@@ -196,6 +230,18 @@ impl Player {
             self.send.send(Arc::new(self.player_state.clone())).ok();
         }
         Ok(())
+    }
+
+    pub async fn jump(
+        &mut self,
+        pos: Duration
+    ) -> Result<(), PlayerError>{
+        if self.player_state.current.is_some(){
+            return self.lavalink.jump_to_time(self.guild, pos).await
+                .map_err(PlayerError::Lavalink)
+        }
+
+        return Err(PlayerError::NoCurrentSong());
     }
 
     pub fn clear_queue(&mut self) {
@@ -358,6 +404,15 @@ impl Display for PlayState {
     }
 }
 
+impl PlayState{
+    pub fn is_paused(&self) -> bool{
+        match self{
+            PlayState::Play => false,
+            PlayState::Pause => true,
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum Playback {
     Normal,
@@ -389,6 +444,8 @@ pub enum PlayerError {
     PlaylistFull(CapacityError<Track>),
     #[error("Search failed: {0:?}")]
     SearchFailed(String),
+    #[error("There is no current song")]
+    NoCurrentSong(),
 }
 
 impl PlayerError {

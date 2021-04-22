@@ -73,7 +73,7 @@ impl Drop for TaskHandle {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take() {
             if let Err(err) = sender.send(Err(TaskHandlerError::Dropped(self.task.take()))) {
-                debug!("Task Error was dropped: {:?}", err.unwrap_err())
+                debug!("Task Error was dropped: {:?}", err)
             }
         }
     }

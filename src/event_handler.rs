@@ -87,14 +87,16 @@ impl PartialEq for Event {
     }
 }
 
-impl EventHandler {
-    pub fn new() -> EventHandler {
+impl Default for EventHandler{
+    fn default() -> Self {
         EventHandler {
             shard_sender: Arc::new(RwLock::new(HashMap::new())),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+}
 
+impl EventHandler {
     pub async fn add_guild(&self, guild: GuildId, event_handler: Arc<dyn GuildEventHandler>) {
         info!("Adding Guild to Event Handler: {:?}", guild);
         let cache = Arc::new(Mutex::new(ArrayDeque::new()));

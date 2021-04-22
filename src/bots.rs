@@ -50,6 +50,27 @@ impl BotMap {
         None
     }
 
+    pub async fn get_any_user_voice_channel(&self, user: &UserId) -> Option<(GuildId, ChannelId)>{
+        //TODO anders lösen?
+        for bot in &self.bots{
+            let guilds = bot.cache.guilds().await;
+            for guild in guilds.iter(){
+                if let Some(voice_states) = bot
+                    .cache
+                    .guild_field(guild, |g| g.voice_states.clone())
+                    .await
+                {
+                    if let Some(vs) = voice_states.get(user){
+                        if let Some(ch) = vs.channel_id{
+                            return Some((*guild, ch))
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
     ///Returns whether non-bot users are in a channel or not
     pub async fn user_in_channel(&self, channel: &ChannelId, guild: &GuildId) -> bool {
         for bot in &self.bots {

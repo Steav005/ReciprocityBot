@@ -15,6 +15,7 @@ use thiserror::Error;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::sync::watch::Receiver as WatchReceiver;
 use tokio::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 pub type PlayerStates = Vec<WatchReceiver<Arc<PlayerState>>>;
 pub type PlayerMapType = TripleHashMap<
@@ -76,9 +77,9 @@ impl PlayerManager {
             .ok_or_else(|| PlayerMapError::NoPlayerFound(request.get_channel()))?;
 
         match request {
-            PlayerRequest::Skip(_) => player.skip().await.map_err(PlayerMapError::PlayerError),
-            PlayerRequest::BackSkip(_) => player
-                .back_skip()
+            PlayerRequest::Skip(i, _) => player.skip(i).await.map_err(PlayerMapError::PlayerError),
+            PlayerRequest::BackSkip(i, _) => player
+                .back_skip(i)
                 .await
                 .map_err(PlayerMapError::PlayerError),
             PlayerRequest::ClearQueue(_) => {
@@ -97,6 +98,10 @@ impl PlayerManager {
                 .enqueue(tracks.drain(..))
                 .await
                 .map_err(PlayerMapError::PlayerError),
+            PlayerRequest::Jump(pos, _) => player
+                .jump(pos)
+                .await
+                .map_err(PlayerMapError::PlayerError)
         }
     }
 
@@ -154,6 +159,10 @@ impl PlayerManager {
 
         info!("Failed Join Request. {:?}, {:?}", self.guild, channel);
         Err(PlayerMapError::NoFreeBot())
+    }
+
+    pub async fn get_player(&self, channel: &ChannelId) -> Option<(UserId, Arc<RwLock<Option<Player>>>)>{
+        self.player.read().await.get_k2(channel).map(|(bot, player)| (*bot, player.clone()))
     }
 
     async fn add_player(&self, bot: UserId, channel: ChannelId) -> Result<(), PlayerMapError> {
@@ -277,12 +286,13 @@ impl PlayerManager {
 pub enum PlayerRequest {
     //Join(ChannelId),
     //Leave(ChannelId),
-    Skip(ChannelId),
-    BackSkip(ChannelId),
+    Skip(usize, ChannelId),
+    BackSkip(usize, ChannelId),
     ClearQueue(ChannelId),
     Playback(Playback, ChannelId),
     PauseResume(ChannelId),
     Enqueue(Vec<Track>, ChannelId),
+    Jump(Duration, ChannelId),
 }
 
 impl PlayerRequest {
@@ -290,12 +300,13 @@ impl PlayerRequest {
         match self {
             //PlayerRequest::Join(channel) => *channel,
             //PlayerRequest::Leave(channel) => *channel,
-            PlayerRequest::Skip(channel) => *channel,
-            PlayerRequest::BackSkip(channel) => *channel,
+            PlayerRequest::Skip(_, channel) => *channel,
+            PlayerRequest::BackSkip(_, channel) => *channel,
             PlayerRequest::ClearQueue(channel) => *channel,
             PlayerRequest::Playback(_, channel) => *channel,
             PlayerRequest::PauseResume(channel) => *channel,
             PlayerRequest::Enqueue(_, channel) => *channel,
+            PlayerRequest::Jump(_, channel) => *channel
         }
     }
 }

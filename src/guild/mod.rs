@@ -72,6 +72,14 @@ impl ReciprocityGuild {
         Ok(guild)
     }
 
+    pub fn get_player_manager(&self) -> Arc<PlayerManager>{
+        self.0.player_manager.clone()
+    }
+
+    pub fn get_id(&self) -> GuildId{
+        self.0.id
+    }
+
     //Delete every irrelevant message
     async fn clear_messages(ctx: Context) {
         info!("Starting clear_messages in {:?}", ctx.id);
@@ -525,8 +533,8 @@ impl GuildEventHandler for ReciprocityGuild {
         //Build Request
         let request = match event {
             EmoteAction::PlayPause() => PlayerRequest::PauseResume(voice_channel),
-            EmoteAction::Next() => PlayerRequest::Skip(voice_channel),
-            EmoteAction::Prev() => PlayerRequest::BackSkip(voice_channel),
+            EmoteAction::Next() => PlayerRequest::Skip(1, voice_channel),
+            EmoteAction::Prev() => PlayerRequest::BackSkip(1, voice_channel),
             EmoteAction::Join() => {
                 let join_res = self.0.player_manager.join(voice_channel).await;
                 match join_res {

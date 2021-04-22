@@ -16,23 +16,25 @@ use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
 use crate::lavalink_handler::LavalinkHandler;
 use lavalink_rs::error::LavalinkError;
 use lavalink_rs::LavalinkClient;
+use crate::net::CompanionCommunicationHandler;
 
 mod bots;
 pub mod config;
 mod context;
 mod event_handler;
-mod guild;
+pub mod guild;
 mod lavalink_handler;
 mod multi_key_map;
 mod player;
 mod task_handle;
+mod net;
 
 pub struct ReciprocityBot {}
 
 impl ReciprocityBot {
     pub async fn run(config: Arc<Config>) -> Result<(), ReciprocityError> {
         //Build EventHandler and Bots using the EventHandler
-        let event_handler = EventHandler::new();
+        let event_handler = EventHandler::default();
         info!("Starting {} Bots", config.bots.len());
         let (bots, join_handles) = start_bots(config.bots.values(), event_handler.clone()).await?;
 
@@ -51,6 +53,7 @@ impl ReciprocityBot {
             lavalink.insert(bot, client);
         }
         let lavalink = Arc::new(lavalink);
+        let mut player_manager = HashMap::new();
 
         //Build every Guild
         info!("Starting {} Guilds", config.guilds.len());
@@ -65,12 +68,18 @@ impl ReciprocityBot {
                 config.clone(),
             )
             .map_err(|e| ReciprocityError::Guild(e, id))?;
+            player_manager.insert(r_guild.get_id(), r_guild.get_player_manager());
 
             //Add Guild to EventHandler and LavalinkEventHandler
             event_handler.add_guild(id, Arc::new(r_guild.clone())).await;
             lavalink_event_handler
                 .add_guild(id, Arc::new(r_guild))
                 .await;
+        }
+
+        if let Some(net_cfg) = config.net.clone(){
+            info!("Starting Network Companion Handler");
+            let _net_handler = CompanionCommunicationHandler::new(net_cfg, bots.clone(), Arc::new(player_manager));
         }
 
         info!("Started Everything");
