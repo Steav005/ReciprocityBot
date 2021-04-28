@@ -50,19 +50,19 @@ impl BotMap {
         None
     }
 
-    pub async fn get_any_user_voice_channel(&self, user: &UserId) -> Option<(GuildId, ChannelId)>{
+    pub async fn get_any_user_voice_channel(&self, user: &UserId) -> Option<(GuildId, ChannelId)> {
         //TODO anders lösen?
-        for bot in &self.bots{
+        for bot in &self.bots {
             let guilds = bot.cache.guilds().await;
-            for guild in guilds.iter(){
+            for guild in guilds.iter() {
                 if let Some(voice_states) = bot
                     .cache
                     .guild_field(guild, |g| g.voice_states.clone())
                     .await
                 {
-                    if let Some(vs) = voice_states.get(user){
-                        if let Some(ch) = vs.channel_id{
-                            return Some((*guild, ch))
+                    if let Some(vs) = voice_states.get(user) {
+                        if let Some(ch) = vs.channel_id {
+                            return Some((*guild, ch));
                         }
                     }
                 }

@@ -87,7 +87,7 @@ impl PartialEq for Event {
     }
 }
 
-impl Default for EventHandler{
+impl Default for EventHandler {
     fn default() -> Self {
         EventHandler {
             shard_sender: Arc::new(RwLock::new(HashMap::new())),

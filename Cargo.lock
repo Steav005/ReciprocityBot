@@ -1157,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "reciprocity_bot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1167,7 +1167,7 @@ dependencies = [
  "futures",
  "lavalink-rs",
  "log",
- "rand 0.8.3",
+ "rand 0.7.3",
  "reciprocity_communication",
  "serde",
  "serde-diff",
@@ -1184,15 +1184,15 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "tungstenite 0.13.0",
+ "tungstenite 0.11.1",
  "url",
  "uuid",
 ]
 
 [[package]]
 name = "reciprocity_communication"
-version = "0.1.8"
-source = "git+https://github.com/Steav005/reciprocity_communication?branch=master#56ca5e27468b92303886f337570ddee8318864f5"
+version = "0.1.9"
+source = "git+https://github.com/Steav005/reciprocity_communication?branch=master#c4bcb92976a5265de0b384820d5fd16bb7d4d859"
 dependencies = [
  "futures",
  "log",
@@ -1997,7 +1997,6 @@ dependencies = [
  "httparse",
  "input_buffer 0.4.0",
  "log",
- "native-tls",
  "rand 0.8.3",
  "rustls",
  "sha-1",
