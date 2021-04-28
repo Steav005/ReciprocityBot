@@ -11,3 +11,6 @@ guilds:
 lavalink:
   address: "autumnal.de"
   password: "youshallnotpass"
+net:
+  address: "127.0.0.1"
+  port: 1337

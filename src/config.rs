@@ -13,7 +13,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct NetConfig{
+pub struct NetConfig {
     pub address: Ipv4Addr,
     pub port: u16,
 }

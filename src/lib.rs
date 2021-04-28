@@ -14,9 +14,9 @@ use crate::config::Config;
 use crate::event_handler::EventHandler;
 use crate::guild::{ReciprocityGuild, ReciprocityGuildError};
 use crate::lavalink_handler::LavalinkHandler;
+use crate::net::CompanionCommunicationHandler;
 use lavalink_rs::error::LavalinkError;
 use lavalink_rs::LavalinkClient;
-use crate::net::CompanionCommunicationHandler;
 
 mod bots;
 pub mod config;
@@ -25,9 +25,9 @@ mod event_handler;
 pub mod guild;
 mod lavalink_handler;
 mod multi_key_map;
+mod net;
 mod player;
 mod task_handle;
-mod net;
 
 pub struct ReciprocityBot {}
 
@@ -77,9 +77,10 @@ impl ReciprocityBot {
                 .await;
         }
 
-        if let Some(net_cfg) = config.net.clone(){
+        if let Some(net_cfg) = config.net.clone() {
             info!("Starting Network Companion Handler");
-            let _net_handler = CompanionCommunicationHandler::new(net_cfg, bots.clone(), Arc::new(player_manager));
+            let _net_handler =
+                CompanionCommunicationHandler::new(net_cfg, bots.clone(), Arc::new(player_manager));
         }
 
         info!("Started Everything");

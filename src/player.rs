@@ -111,8 +111,8 @@ impl Player {
 
     pub async fn skip(&mut self, i: usize) -> Result<(), PlayerError> {
         //Leave if skip amount is 0
-        if i == 0{
-            return Ok(())
+        if i == 0 {
+            return Ok(());
         }
 
         let mut changed = false;
@@ -134,24 +134,22 @@ impl Player {
         }
         //}
 
-        for _i in 0..i-1{
-            if let Some(track) = self.player_state.history.pop_front(){
-                if self.player_state.history.is_full() {
-                    self.player_state
-                        .history
-                        .pop_back()
-                        .expect("History is empty");
+        for _i in 0..i - 1 {
+            if let Some(track) = self.player_state.playlist.pop_front() {
+                let push_to = match self.player_state.playback {
+                    Playback::AllLoop => self.player_state.playlist.borrow_mut(),
+                    _ => self.player_state.history.borrow_mut(),
+                };
+                if push_to.is_full() {
+                    push_to.pop_back().expect("PushTo is empty");
                 }
-                self.player_state
-                    .history
-                    .push_front(track)
-                    .expect("History is full");
+                push_to.push_front(track).expect("PushTo is full");
             } else {
                 break;
             }
         }
 
-        if changed{
+        if changed {
             self.send.send(Arc::new(self.player_state.clone())).ok();
         }
 
@@ -162,8 +160,8 @@ impl Player {
     }
 
     pub async fn back_skip(&mut self, i: usize) -> Result<(), PlayerError> {
-        if i == 0{
-            return Ok(())
+        if i == 0 {
+            return Ok(());
         }
 
         let mut changed = false;
@@ -185,7 +183,7 @@ impl Player {
         }
 
         for _i in 0..i {
-            if let Some(history_track) = self.player_state.history.pop_back() {
+            if let Some(history_track) = self.player_state.history.pop_front() {
                 if self.player_state.playlist.is_full() {
                     self.player_state
                         .playlist
@@ -232,13 +230,13 @@ impl Player {
         Ok(())
     }
 
-    pub async fn jump(
-        &mut self,
-        pos: Duration
-    ) -> Result<(), PlayerError>{
-        if self.player_state.current.is_some(){
-            return self.lavalink.jump_to_time(self.guild, pos).await
-                .map_err(PlayerError::Lavalink)
+    pub async fn jump(&mut self, pos: Duration) -> Result<(), PlayerError> {
+        if self.player_state.current.is_some() {
+            return self
+                .lavalink
+                .jump_to_time(self.guild, pos)
+                .await
+                .map_err(PlayerError::Lavalink);
         }
 
         return Err(PlayerError::NoCurrentSong());
@@ -404,9 +402,9 @@ impl Display for PlayState {
     }
 }
 
-impl PlayState{
-    pub fn is_paused(&self) -> bool{
-        match self{
+impl PlayState {
+    pub fn is_paused(&self) -> bool {
+        match self {
             PlayState::Play => false,
             PlayState::Pause => true,
         }

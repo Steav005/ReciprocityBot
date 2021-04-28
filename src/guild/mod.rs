@@ -72,11 +72,11 @@ impl ReciprocityGuild {
         Ok(guild)
     }
 
-    pub fn get_player_manager(&self) -> Arc<PlayerManager>{
+    pub fn get_player_manager(&self) -> Arc<PlayerManager> {
         self.0.player_manager.clone()
     }
 
-    pub fn get_id(&self) -> GuildId{
+    pub fn get_id(&self) -> GuildId {
         self.0.id
     }
 
