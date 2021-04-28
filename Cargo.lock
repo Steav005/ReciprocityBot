@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "reciprocity_bot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1066,7 +1066,7 @@ dependencies = [
  "futures",
  "lavalink-rs",
  "log",
- "rand 0.8.3",
+ "rand 0.7.3",
  "reciprocity_communication",
  "serde",
  "serde-diff",
@@ -1090,7 +1090,8 @@ dependencies = [
 
 [[package]]
 name = "reciprocity_communication"
-version = "0.1.10"
+version = "0.1.11"
+source = "git+https://github.com/Steav005/reciprocity_communication?branch=master#f52b2130d7c8f261bd8912f14b31c745570639e4"
 dependencies = [
  "futures",
  "log",
