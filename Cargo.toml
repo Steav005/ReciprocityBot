@@ -1,6 +1,6 @@
 [package]
 name = "reciprocity_bot"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Autumnal <friedrich122112@googlemail.com>"]
 edition = "2018"
 
@@ -21,7 +21,7 @@ serde_yaml = "^0"
 serde = { version = "^1", features = ["derive"] }
 arraydeque = "^0"
 tokio-tungstenite = "^0"
-tungstenite = "^0"
+tungstenite = {version = "^0", default-features = false, features = ["rustls-tls"]}
 strum = "^0"
 strum_macros = "^0"
 tokio-stream = "^0"
