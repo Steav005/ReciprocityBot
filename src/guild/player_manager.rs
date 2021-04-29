@@ -133,6 +133,10 @@ impl PlayerManager {
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
+        if self.bot_in_channel(&channel).await{
+            return Err(PlayerMapError::BotAlreadyInChannel(channel));
+        }
+
         info!("Handling Join Request. {:?}, {:?}", self.guild, channel);
         let mut bot_vec = self
             .player
@@ -337,6 +341,8 @@ pub enum PlayerMapError {
     PlayerAlreadyExists(UserId),
     #[error("No Lavalink for Bot with ID: {0:?}")]
     NoLavalink(UserId),
+    #[error("There is already an active player for the channel: {0:?}")]
+    BotAlreadyInChannel(ChannelId),
 }
 
 impl PlayerMapError {

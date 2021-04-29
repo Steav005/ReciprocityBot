@@ -160,7 +160,7 @@ impl ClientConnection {
             };
             if let Message::ClientRequest(req) = msg {
                 match req {
-                    ClientRequest::Authenticate(a) => self.auth(a),
+                    ClientRequest::Authenticate(a) => self.auth(a).await,
                     ClientRequest::AuthStatus() => self.send_auth_status(),
                     ClientRequest::Control(con) => self.handle_control_req(con),
                     ClientRequest::End() => {
@@ -265,51 +265,54 @@ impl ClientConnection {
         });
     }
 
-    fn auth(&self, auth: Auth) {
-        let s = self.clone();
-        tokio::spawn(async move {
-            //Exchange Token
-            let token_res = get_token(auth).await;
-            let (access_token, refresh_token) = match token_res {
-                Ok(token) => token,
-                Err(e) => {
-                    warn!("Auth Error. {:?}, {:?}", s.peer, e);
-                    s.respond(Message::Auth(AuthMessage::AuthError()));
-                    return;
-                }
-            };
-            //Get User
-            let user_res = get_user_id(access_token.clone()).await;
-            let user = match user_res {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!("Get Client Id Error. {:?}, {:?}", s.peer, e);
-                    s.respond(Message::Auth(AuthMessage::AuthError()));
-                    return;
-                }
-            };
-            //Insert into own Struct
-            *s.user.write().await = Some((user.clone(), access_token));
+    async fn auth(&self, auth: Auth) {
+        //Exchange Token
+        let token_res = get_token(auth).await;
+        let (access_token, refresh_token) = match token_res {
+            Ok(token) => token,
+            Err(e) => {
+                warn!("Auth Error. {:?}, {:?}", self.peer, e);
+                self.clone()
+                    .sync_respond(Message::Auth(AuthMessage::AuthError()))
+                    .await;
+                return;
+            }
+        };
+        //Get User
+        let user_res = get_user_id(access_token.clone()).await;
+        let user = match user_res {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("Get Client Id Error. {:?}, {:?}", self.peer, e);
+                self.clone()
+                    .sync_respond(Message::Auth(AuthMessage::AuthError()))
+                    .await;
+                return;
+            }
+        };
+        //Insert into own Struct
+        *self.user.write().await = Some((user.clone(), access_token));
 
-            //Send positive response
-            s.respond(Message::Auth(AuthMessage::AuthSuccess(
+        //Send positive response
+        self.clone()
+            .sync_respond(Message::Auth(AuthMessage::AuthSuccess(
                 user.clone(),
                 refresh_token,
-            )));
-            info!("Authenticated User: {:?}, {:?}", s.peer, s.user);
+            )))
+            .await;
+        info!("Authenticated User: {:?}, {:?}", self.peer, self.user);
 
-            //remove old voice state sender if it exists
-            let mut lock = s.voice_state_sender.lock().await;
-            if let Some(vss) = lock.take() {
-                //Reset Voice State, Send empty Voice State and Stop Voice State sender
-                *s.voice_state.write().await = None;
-                s.send_voice_state(None);
-                vss.abort();
-            }
-            //Insert new one
-            *lock = Some(tokio::spawn(s.clone().voice_state_sender_run(user)));
-            drop(lock)
-        });
+        //remove old voice state sender if it exists
+        let mut lock = self.voice_state_sender.lock().await;
+        if let Some(vss) = lock.take() {
+            //Reset Voice State, Send empty Voice State and Stop Voice State sender
+            *self.voice_state.write().await = None;
+            self.send_voice_state(None);
+            vss.abort();
+        }
+        //Insert new one
+        *lock = Some(tokio::spawn(self.clone().voice_state_sender_run(user)));
+        drop(lock)
     }
 
     fn send_auth_status(&self) {

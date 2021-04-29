@@ -1,39 +1,39 @@
 [package]
 name = "reciprocity_bot"
-version = "0.2.2"
+version = "0.2.3"
 authors = ["Autumnal <friedrich122112@googlemail.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-arrayvec = "^0"
-log = "^0"
-simple-logging = "^2"
-tracing = "^0"
-tracing-subscriber = "^0"
-futures = "^0"
-arc-swap = "^1"
-anyhow = "^1"
-thiserror = "^1"
-serde_json = "^1"
-serde_yaml = "^0"
-serde = { version = "^1", features = ["derive"] }
-arraydeque = "^0"
-tokio-tungstenite = "^0"
+arrayvec = "^0.7"
+log = "^0.4"
+simple-logging = "^2.0"
+tracing = "^0.1"
+tracing-subscriber = "^0.2"
+futures = "^0.3"
+arc-swap = "^1.2"
+anyhow = "^1.0"
+thiserror = "^1.0"
+serde_json = "^1.0"
+serde_yaml = "^0.8"
+serde = { version = "^1.0", features = ["derive"] }
+arraydeque = "^0.4"
+tokio-tungstenite = "^0.14"
 tungstenite = {version = "^0.13", default-features = false, features = ["rustls-tls"]}
-strum = "^0"
-strum_macros = "^0"
-tokio-stream = "^0"
-rand = "^0"
-clap = "^2"
-url = "^2"
-uuid = { version = "^0", features = ["v4"] }
-serde-diff = "^0"
+strum = "^0.20"
+strum_macros = "^0.20"
+tokio-stream = "^0.1"
+rand = "^0.8"
+clap = "^2.0"
+url = "^2.2"
+uuid = { version = "^0.8", features = ["v4"] }
+serde-diff = "^0.4"
 
-tokio = { version = "^1", features = ["rt-multi-thread", "time", "sync", "net"] }
-serenity = { version = "^0", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
-songbird = { version = "^0", default-features = false, features = ["serenity-rustls", "gateway"]}
+tokio = { version = "^1.5", features = ["rt-multi-thread", "time", "sync", "net"] }
+serenity = { version = "^0.10", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
+songbird = { version = "^0.1", default-features = false, features = ["serenity-rustls", "gateway"]}
 lavalink-rs = { git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}
 #reciprocity_communication = {path = "../reciprocity_communication", features = ["host"]}
 reciprocity_communication = {git = "https://github.com/Steav005/reciprocity_communication", branch = "master", features = ["host"]}
