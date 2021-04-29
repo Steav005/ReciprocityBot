@@ -56,10 +56,6 @@ impl PlayerManager {
         }
     }
 
-    pub async fn bot_in_channel(&self, channel: &ChannelId) -> bool {
-        self.player.read().await.contains_k2(channel)
-    }
-
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
         info!("Handling Player Request. {:?}, {:?}", self.guild, request);
         let player = self
@@ -133,7 +129,7 @@ impl PlayerManager {
     }
 
     pub async fn join(&self, channel: ChannelId) -> Result<(), PlayerMapError> {
-        if self.bot_in_channel(&channel).await{
+        if self.bot_in_channel(&channel).await {
             return Err(PlayerMapError::BotAlreadyInChannel(channel));
         }
 
@@ -177,6 +173,10 @@ impl PlayerManager {
 
     async fn add_player(&self, bot: UserId, channel: ChannelId) -> Result<(), PlayerMapError> {
         let mut map_lock = self.player.write().await;
+        if map_lock.contains_k2(&channel) {
+            return Err(PlayerMapError::BotAlreadyInChannel(channel));
+        }
+
         let player = map_lock
             .get(&bot)
             .cloned()

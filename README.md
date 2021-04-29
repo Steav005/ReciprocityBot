@@ -9,6 +9,7 @@
 - [x] Hacky Delay Entfernen (Clear Channel)
 - [x] Add small delay to deleting user messages, so no artifacts are left behind
 - [x] Add Paused Hint to Main Message if Playback is paused
+- [x] Better Double Bot Join Protection
 - [ ] Reconsider Log level assignment
 
 ## ERROR
