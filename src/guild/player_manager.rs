@@ -56,6 +56,10 @@ impl PlayerManager {
         }
     }
 
+    pub async fn bot_in_channel(&self, channel: &ChannelId) -> bool {
+        self.player.read().await.contains_k2(channel)
+    }
+
     pub async fn request(&self, request: PlayerRequest) -> Result<(), PlayerMapError> {
         info!("Handling Player Request. {:?}, {:?}", self.guild, request);
         let player = self

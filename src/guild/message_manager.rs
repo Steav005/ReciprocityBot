@@ -379,10 +379,25 @@ impl MainMessage {
             if let Err(e) = edit_res {
                 //BREAK Update Loop if error occurred
                 warn!(
-                    "Error updating Message: {:?},  {:?}, {:?}",
+                    "Error updating Message: {:?}, {:?}, {:?}",
                     message.id, self.context.id, e
                 );
-                return;
+                //Check if this message is still the official main message
+                if let Some((msg, _)) = self.context.main_message.read().await.deref() {
+                    if msg.message.id.eq(&message.id) {
+                        debug!(
+                            "Main Message is still the same. {:?}, {:?}",
+                            message.id, self.context.id
+                        );
+                        continue;
+                    } else {
+                        debug!(
+                            "Main Message changed. Ending Update Loop. New: {:?}, Old: {:?}, {:?}",
+                            msg.message.id, message.id, self.context.id
+                        );
+                        return;
+                    }
+                }
             }
         }
     }

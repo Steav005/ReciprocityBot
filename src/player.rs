@@ -118,32 +118,20 @@ impl Player {
         let mut changed = false;
 
         //If loop is one, move the current track to history, so a new Track gets played
-        //if let Playback::OneLoop = self.player_state.playback {
         if let Some((_, track)) = self.player_state.current.take() {
-            if self.player_state.history.is_full() {
-                self.player_state
-                    .history
-                    .pop_back()
-                    .expect("History is empty");
+            match self.player_state.playback {
+                Playback::AllLoop => self.push_to_playlist_back(track),
+                _ => self.push_to_history_front(track),
             }
-            self.player_state
-                .history
-                .push_front(track)
-                .expect("History is full");
             changed = true;
         }
-        //}
 
         for _i in 0..i - 1 {
             if let Some(track) = self.player_state.playlist.pop_front() {
-                let push_to = match self.player_state.playback {
-                    Playback::AllLoop => self.player_state.playlist.borrow_mut(),
-                    _ => self.player_state.history.borrow_mut(),
-                };
-                if push_to.is_full() {
-                    push_to.pop_back().expect("PushTo is empty");
+                match self.player_state.playback {
+                    Playback::AllLoop => self.push_to_playlist_back(track),
+                    _ => self.push_to_history_front(track),
                 }
-                push_to.push_front(track).expect("PushTo is full");
             } else {
                 break;
             }
@@ -168,32 +156,14 @@ impl Player {
         let mut current_was_some = false;
 
         if let Some((_, track)) = self.player_state.current.take() {
-            if self.player_state.playlist.is_full() {
-                self.player_state
-                    .playlist
-                    .pop_back()
-                    .expect("Playlist is empty");
-            }
-            self.player_state
-                .playlist
-                .push_front(track)
-                .expect("Playlist is full");
+            self.push_to_playlist_front(track);
             changed = true;
             current_was_some = true;
         }
 
         for _i in 0..i {
             if let Some(history_track) = self.player_state.history.pop_front() {
-                if self.player_state.playlist.is_full() {
-                    self.player_state
-                        .playlist
-                        .pop_back()
-                        .expect("Playlist is empty");
-                }
-                self.player_state
-                    .playlist
-                    .push_front(history_track)
-                    .expect("Playlist is full");
+                self.push_to_playlist_front(history_track);
                 changed = true;
             }
         }
@@ -209,6 +179,45 @@ impl Player {
         } else {
             self.play_next().await
         }
+    }
+
+    fn push_to_history_front(&mut self, track: Track) {
+        if self.player_state.history.is_full() {
+            self.player_state
+                .history
+                .pop_back()
+                .expect("History is empty");
+        }
+        self.player_state
+            .history
+            .push_front(track)
+            .expect("History is full");
+    }
+
+    fn push_to_playlist_back(&mut self, track: Track) {
+        if self.player_state.playlist.is_full() {
+            self.player_state
+                .playlist
+                .pop_back()
+                .expect("Playlist is empty");
+        }
+        self.player_state
+            .playlist
+            .push_back(track)
+            .expect("Playlist is full");
+    }
+
+    fn push_to_playlist_front(&mut self, track: Track) {
+        if self.player_state.playlist.is_full() {
+            self.player_state
+                .playlist
+                .pop_back()
+                .expect("Playlist is empty");
+        }
+        self.player_state
+            .playlist
+            .push_front(track)
+            .expect("Playlist is full");
     }
 
     pub async fn enqueue(
@@ -301,32 +310,14 @@ impl Player {
             //Add Current to History
             Playback::Normal => {
                 if let Some((_, track)) = self.player_state.current.take() {
-                    if self.player_state.history.is_full() {
-                        self.player_state
-                            .history
-                            .pop_back()
-                            .expect("History is empty");
-                    }
-                    self.player_state
-                        .history
-                        .push_front(track)
-                        .expect("History is full");
+                    self.push_to_history_front(track);
                     changed = true;
                 }
             }
             //Add Current to Playlist
             Playback::AllLoop => {
                 if let Some((_, track)) = self.player_state.current.take() {
-                    if self.player_state.playlist.is_full() {
-                        self.player_state
-                            .playlist
-                            .pop_back()
-                            .expect("Playlist is empty");
-                    }
-                    self.player_state
-                        .playlist
-                        .push_back(track)
-                        .expect("Playlist is full");
+                    self.push_to_playlist_back(track);
                     changed = true;
                 }
             }

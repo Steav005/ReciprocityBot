@@ -25,3 +25,5 @@
 - [x] Bot leaved wenn irgendwer leaved und nicht wenn der channel leer ist
 - [x] Reactions der Main Message können noch immer gelöscht werden
 - [ ] Bulk Delete ist nicht immer erfolgreich
+- [x] Main Message update kann Fehlschlagen und dann gibt es keine weiteren updates mehr
+- [x] AllLoop skip skippt immer nur 1 und das was vorher abgespielt wurde kommt in die History
