@@ -9,7 +9,7 @@ use reciprocity_communication::host::*;
 use reciprocity_communication::messages::oauth2::AccessToken;
 use reciprocity_communication::messages::{
     Auth, AuthMessage, BotInfo, ClientRequest, Message, PlayMode, PlayerControl, PlayerState,
-    State, Track, Unexpected, User, VoiceState,
+    State, Track, Unexpected, User, VoiceState, PlayerControlResult
 };
 use serenity::model::prelude::{ChannelId, GuildId, UserId};
 use serenity::model::user::CurrentUser;
@@ -19,13 +19,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
+use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 use tokio_tungstenite::{accept_async, WebSocketStream};
+use tokio::sync::broadcast::error::RecvError;
+
+type ControlBroadcast = Arc<RwLock<BroadcastSender<PlayerControlResult>>>;
 
 #[derive(Clone)]
 pub struct CompanionCommunicationHandler {
     players: Arc<HashMap<GuildId, Arc<PlayerManager>>>,
+    request_result_map: Arc<RwLock<HashMap<ChannelId, ControlBroadcast>>>,
     bots: Arc<BotMap>,
 }
 
@@ -35,7 +40,7 @@ impl CompanionCommunicationHandler {
         bots: Arc<BotMap>,
         players: Arc<HashMap<GuildId, Arc<PlayerManager>>>,
     ) -> Self {
-        let comp = CompanionCommunicationHandler { players, bots };
+        let comp = CompanionCommunicationHandler { players, request_result_map: Arc::new(Default::default()), bots };
 
         tokio::spawn(comp.clone().run(cfg));
         comp
@@ -104,6 +109,7 @@ struct ClientConnection {
     voice_state: Arc<RwLock<Option<(GuildId, ChannelId)>>>,
     player_state_sender: Arc<Mutex<Option<JoinHandle<()>>>>,
     voice_state_sender: Arc<Mutex<Option<JoinHandle<()>>>>,
+    control_update_sender: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl ClientConnection {
@@ -126,6 +132,7 @@ impl ClientConnection {
             voice_state: Arc::new(RwLock::new(None)),
             player_state_sender: Arc::new(Mutex::new(None)),
             voice_state_sender: Arc::new(Mutex::new(None)),
+            control_update_sender: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -162,7 +169,7 @@ impl ClientConnection {
                 match req {
                     ClientRequest::Authenticate(a) => self.auth(a).await,
                     ClientRequest::AuthStatus() => self.send_auth_status(),
-                    ClientRequest::Control(con) => self.handle_control_req(con),
+                    ClientRequest::Control(uuid, con) => self.handle_control_req(uuid, con),
                     ClientRequest::End() => {
                         info!("Received End Request. {:?}", self.peer);
                         break;
@@ -184,16 +191,44 @@ impl ClientConnection {
             debug!("Ending Player State Sender. {:?}", self.peer);
             pss.abort();
         }
+        if let Some(cus) = self.control_update_sender.lock().await.take() {
+            debug!("Ending Control Update Sender. {:?}", self.peer);
+            cus.abort();
+        }
     }
 
-    fn handle_control_req(&self, con: PlayerControl) {
+    fn handle_control_req(&self, uuid: String, con: PlayerControl) {
         info!("Handling Control Request. {:?}, {:?}", self.peer, con);
         let s = self.clone();
         tokio::spawn(async move {
+            let mut control_result = PlayerControlResult{
+                uuid,
+                user: User{
+                    username: String::default(),
+                    id: String::default(),
+                    avatar: String::default(),
+                },
+                req: con.clone(),
+                res: Ok(())
+            };
+
+            let user = s.user.read().await.as_ref().cloned();
+            control_result.user = match user{
+                Some((user, _)) => user,
+                None => {
+                    warn!("Could not find User for Connection. {:?}", s.peer);
+                    control_result.res = Err("Not Authenticated".to_string());
+                    s.sync_respond(Message::ClientControlResult(control_result)).await;
+                    return;
+                }
+            };
+
             let vs_op = *s.voice_state.read().await;
             let (guild, channel) = match vs_op {
                 None => {
                     warn!("There is no player to control. {:?}, {:?}", s.peer, con);
+                    control_result.res = Err("No Bot in Channel".to_string());
+                    s.sync_respond(Message::ClientControlResult(control_result)).await;
                     return;
                 }
                 Some(vs) => vs,
@@ -203,6 +238,8 @@ impl ClientConnection {
             let player_manager = match player_manager_op {
                 None => {
                     error!("Got no Player Manager for Guild. {:?}, {:?}", s.peer, guild);
+                    control_result.res = Err("Internal Error".to_string());
+                    s.sync_respond(Message::ClientControlResult(control_result)).await;
                     return;
                 }
                 Some(pm) => pm.clone(),
@@ -256,11 +293,23 @@ impl ClientConnection {
                 PlayerControl::Leave() => player_manager.leave(channel).await,
                 PlayerControl::Join() => player_manager.join(channel).await,
             };
-            if let Err(e) = res {
+            if let Err(e) = res{
                 warn!(
                     "Player Control Error. {:?}, {:?}, {:?}, {:?}",
                     s.peer, guild, channel, e
                 );
+                control_result.res = Err(format!("{:?}", e));
+                s.sync_respond(Message::ClientControlResult(control_result)).await;
+                return;
+            }
+            let broadcast = s.com.request_result_map.read().await.get(&channel).cloned();
+            if let Some(broadcast) = broadcast {
+                if let Err(e) = broadcast.read().await.send(control_result) {
+                    error!("Error adding control result to broadcast. {:?}, {:?}, {:?}, {:?}", e, s.peer, guild, channel);
+                    return;
+                }
+            } else {
+                s.sync_respond(Message::ClientControlResult(control_result)).await;
             }
         });
     }
@@ -373,10 +422,16 @@ impl ClientConnection {
             }
 
             //Something changed so we drop the current Player State Sender, if it exists
-            let mut lock_sender = self.player_state_sender.lock().await;
-            if let Some(pss) = lock_sender.take() {
+            let mut lock_state_sender = self.player_state_sender.lock().await;
+            if let Some(pss) = lock_state_sender.take() {
                 info!("Stopping Player State Sender. {:?}", self.peer);
                 pss.abort();
+            }
+            //Same goes for the Control Update Sender
+            let mut lock_control_sender = self.control_update_sender.lock().await;
+            if let Some(cus) = lock_control_sender.take() {
+                info!("Stopping Control Update Sender. {:?}", self.peer);
+                cus.abort();
             }
 
             //Replace last check channel, locally and behind the lock
@@ -388,7 +443,8 @@ impl ClientConnection {
                 None => {
                     //New Channel is none, so we just continue but send the voice_state first
                     self.send_voice_state(None);
-                    drop(lock_sender);
+                    drop(lock_control_sender);
+                    drop(lock_state_sender);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -399,10 +455,16 @@ impl ClientConnection {
             self.send_voice_state(Some((guild, new_channel)));
 
             //Starting Player State Sender
-            *lock_sender = Some(tokio::spawn(
+            *lock_state_sender = Some(tokio::spawn(
                 self.clone().player_state_sender_run(guild, new_channel),
             ));
-            drop(lock_sender);
+            //Starting Control Update Sender
+            *lock_control_sender = Some(tokio::spawn(
+                self.clone().player_control_update_run(guild, new_channel),
+            ));
+
+            drop(lock_control_sender);
+            drop(lock_state_sender);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -457,6 +519,45 @@ impl ClientConnection {
         });
     }
 
+    async fn player_control_update_run(self, guild: GuildId, channel: ChannelId){
+        let map_lock = self.com.request_result_map.read().await;
+        let broadcast = map_lock.get(&channel).cloned();
+        drop(map_lock);
+        let mut broadcast = match broadcast{
+            Some(broadcast) => broadcast.read().await.subscribe(),
+            None => {
+                let mut map_lock = self.com.request_result_map.write().await;
+                let broadcast = map_lock.get(&channel).cloned();
+                let rec = match broadcast {
+                    Some(broadcast) => broadcast.read().await.subscribe(),
+                    None => {
+                        let (send, rec) = tokio::sync::broadcast::channel(100);
+                        map_lock.insert(channel, Arc::new(RwLock::new(send)));
+                        rec
+                    }
+                };
+                drop(map_lock);
+                rec
+            }
+        };
+
+        loop {
+            let msg = broadcast.recv().await;
+            let pcr = match msg{
+                Ok(pcr) => pcr,
+                Err(RecvError::Lagged(i)) => {
+                    warn!("Lagged behind by {} Messages. Player Control Update. {:?}, {:?}, {:?}", i, self.peer, guild, channel);
+                    continue;
+                }
+                Err(RecvError::Closed) => {
+                    error!("Channel Broadcast was Closed. Player Control Update. {:?}, {:?}, {:?}", self.peer, guild, channel);
+                    return;
+                }
+            };
+            self.clone().sync_respond(Message::ClientControlResult(pcr)).await;
+        }
+    }
+
     async fn player_state_sender_run(self, guild: GuildId, channel: ChannelId) {
         info!("Starting Player State Sender Run. {:?}", self.peer);
         //Get Player Manager for Guild
@@ -471,6 +572,11 @@ impl ClientConnection {
             }
             Some(pm) => pm,
         };
+
+        //Send initial empty state
+        if player_manager.get_player(&channel).await.is_none(){
+            self.clone().sync_respond(Message::PlayerState(None)).await;
+        }
 
         //Main loop in player state sender run
         'main: loop {
