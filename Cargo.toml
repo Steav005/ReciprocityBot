@@ -1,6 +1,6 @@
 [package]
 name = "reciprocity_bot"
-version = "0.2.7"
+version = "0.2.8"
 authors = ["Autumnal <friedrich122112@googlemail.com>"]
 edition = "2018"
 
@@ -22,8 +22,8 @@ serde = { version = "^1.0", features = ["derive"] }
 arraydeque = "^0.4"
 tokio-tungstenite = "^0.14"
 tungstenite = {version = "^0.13", default-features = false, features = ["rustls-tls"]}
-strum = "^0.20"
-strum_macros = "^0.20"
+strum = "^0.21"
+strum_macros = "^0.21"
 tokio-stream = "^0.1"
 rand = "^0.8"
 clap = "^2.0"
@@ -34,6 +34,6 @@ serde-diff = "^0.4"
 tokio = { version = "^1.5", features = ["rt-multi-thread", "time", "sync", "net"] }
 serenity = { version = "^0.10", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend", "voice", "extras", "collector"]}
 songbird = { version = "^0.1", default-features = false, features = ["serenity-rustls", "gateway"]}
-lavalink-rs = { git = "https://gitlab.com/nitsuga5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}
+lavalink-rs = { git = "https://gitlab.com/vicky5124/lavalink-rs", branch = "master", features = ["serenity", "rustls"]}
 #reciprocity_communication = {path = "../reciprocity_communication", features = ["host"]}
 reciprocity_communication = {git = "https://github.com/Steav005/reciprocity_communication", branch = "master", features = ["host"]}

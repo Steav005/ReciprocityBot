@@ -252,7 +252,7 @@ impl ClientConnection {
                         .await
                 }
                 PlayerControl::Enqueue(url) => {
-                    let res = player_manager.search(channel, url.into_string()).await;
+                    let res = player_manager.search(channel, url.into()).await;
                     match res {
                         Ok((_, mut tracks)) => {
                             player_manager
